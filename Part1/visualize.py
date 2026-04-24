@@ -50,15 +50,26 @@ def _color_for(role: str) -> str:
     }[role]
 
 
+_ROLE_SORT_KEY = {"input": 0, "bias": 1, "hidden": 2, "output": 3}
+
+
 def layered_positions(graph) -> dict[int, tuple[float, float]]:
-    """Group nodes by topological level and spread them vertically per level."""
+    """Group nodes by topological level and spread them vertically per level.
+
+    Within a level, nodes are ordered by role (inputs → biases → hidden →
+    outputs) then by node id, so the layout is deterministic and easy to
+    read.
+    """
     level_nodes = graph.level_nodes.tolist()
     level_starts = graph.level_starts.tolist()
     pos = {}
     n_levels = len(level_starts) - 1
     for ℓ in range(n_levels):
         s, e = level_starts[ℓ], level_starts[ℓ + 1]
-        nodes = level_nodes[s:e]
+        nodes = sorted(
+            level_nodes[s:e],
+            key=lambda i: (_ROLE_SORT_KEY[_role_of(i, graph)], i),
+        )
         if not nodes:
             continue
         n = len(nodes)
@@ -79,8 +90,11 @@ def draw(graph, weights: np.ndarray, out_path: str, title: str | None = None):
     # Linewidth in [0.3, 2.8] scaled by |weight|.
     lw = 0.3 + 2.5 * (w_abs / (w_max + 1e-12))
 
-    fig, ax = plt.subplots(figsize=(11, 6))
-    ax.set_axis_off()
+    fig, ax = plt.subplots(figsize=(13, 6))
+
+    # Light vertical gridlines marking each topological level.
+    for ℓ in range(graph.n_levels):
+        ax.axvline(ℓ, color="#DDDDDD", linewidth=0.8, zorder=0)
 
     # Edges first (so nodes draw on top).
     for e in range(len(edge_src)):
@@ -123,7 +137,13 @@ def draw(graph, weights: np.ndarray, out_path: str, title: str | None = None):
                  f"{graph.n_levels} levels")
     ax.set_title(title)
     ax.set_xlim(-0.5, graph.n_levels - 0.5)
-    ax.set_ylim(-1.1, 1.1)
+    ax.set_ylim(-1.25, 1.25)
+    ax.set_xticks(range(graph.n_levels))
+    ax.set_xticklabels([f"L{ℓ}" for ℓ in range(graph.n_levels)], fontsize=9)
+    ax.set_yticks([])
+    ax.set_xlabel("topological level (longest path from inputs/biases)")
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")

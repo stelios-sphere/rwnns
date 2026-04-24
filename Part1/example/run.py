@@ -109,7 +109,7 @@ def main():
     )
     print(f"saved  {npz_path}")
 
-    # Architecture plot (networkx, layered layout).
+    # Architecture plot of the trained 1000-node model (networkx, dense).
     arch_path = os.path.join(HERE, "architecture.png")
     draw_architecture(
         graph,
@@ -119,6 +119,24 @@ def main():
                f"{graph.n_edges} edges, {graph.n_levels} layers"),
     )
     print(f"saved  {arch_path}")
+
+    # Also render a small representative DAG so the networkx structure is
+    # visually legible. Same builder, same number of layers, untrained —
+    # this is a structural view, not a trained-weight heatmap.
+    small_graph = build_layered_rwnn(
+        n_nodes=30, edge_prob=0.3, n_layers=N_LAYERS, seed=SEED,
+    )
+    small_net = RWNN(small_graph, device=device)
+    small_path = os.path.join(HERE, "architecture_small.png")
+    draw_architecture(
+        small_graph,
+        small_net.weights,
+        small_path,
+        title=(f"Small representative DAG — {small_graph.n_nodes} nodes, "
+               f"{small_graph.n_edges} edges, {small_graph.n_levels} layers "
+               f"(structure preview, untrained)"),
+    )
+    print(f"saved  {small_path}")
 
     # 3D surface plot.
     def predict_np(pts: np.ndarray) -> np.ndarray:

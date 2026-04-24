@@ -11,7 +11,8 @@ full-batch Adam on 5,000 random points in `[-1, 1]²` targeting
 
 | file | what it is |
 |---|---|
-| `architecture.png` | networkx render of the DAG, layered by topological level. |
+| `architecture.png` | networkx render of the trained 1000-node DAG, layered by topological level. Very dense — good for seeing aggregate structure. |
+| `architecture_small.png` | networkx render of a small 30-node / 5-layer DAG built with the same builder. Individual nodes and curved edges are clearly visible — use this to understand the layout style. |
 | `predictions_3d.png` | Matplotlib 3D surface of the RWNN prediction vs. the target wireframe, plus a training-point scatter and a residual surface. |
 | `results.npz` | Raw `x_test`, `y_test`, `pred_test`, learned weights, edge tables, MSE values, per-level node counts. |
 

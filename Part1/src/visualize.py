@@ -111,18 +111,39 @@ def draw_architecture(
     for ℓ in range(graph.n_levels):
         ax.axvline(ℓ, color="#DDDDDD", linewidth=0.8, zorder=0)
 
-    # Edges — styled by sign + magnitude.
-    w_arr = np.array([g.edges[e]["weight"] for e in g.edges])
+    # Edges — styled by sign + magnitude, drawn with curvature so many
+    # parallel edges between the same two columns don't collapse onto
+    # the same line. Two passes with opposite curvature, split by edge
+    # index parity, spread them out visually.
+    edges_list = list(g.edges())
+    w_arr = np.array([g.edges[e]["weight"] for e in edges_list])
     w_abs = np.abs(w_arr)
     w_max = float(w_abs.max()) if w_abs.size else 1.0
     widths = 0.3 + 2.5 * (w_abs / (w_max + 1e-12))
     edge_colors = ["#2E6FB7" if w >= 0 else "#C0392B" for w in w_arr]
 
-    nx.draw_networkx_edges(
-        g, pos, ax=ax,
-        edge_color=edge_colors, width=widths, alpha=0.75,
-        arrows=False,  # feed-forward is clear from layout; arrows clutter at scale
-    )
+    # Scale curvature down for wider graphs so the bend isn't excessive.
+    base_rad = 0.18 if graph.n_levels <= 6 else 0.12
+
+    def _pass(mask, rad):
+        if not any(mask):
+            return
+        nx.draw_networkx_edges(
+            g, pos, ax=ax,
+            edgelist=[e for e, m in zip(edges_list, mask) if m],
+            edge_color=[c for c, m in zip(edge_colors, mask) if m],
+            width=[w for w, m in zip(widths, mask) if m],
+            alpha=0.6,
+            arrows=True,          # required for connectionstyle to take effect
+            arrowstyle="-",       # no arrowhead — feed-forward is obvious
+            connectionstyle=f"arc3,rad={rad}",
+            node_size=node_size,  # so the curve starts at the node edge
+        )
+
+    even = [i % 2 == 0 for i in range(len(edges_list))]
+    odd = [not v for v in even]
+    _pass(even, +base_rad)
+    _pass(odd, -base_rad)
 
     # Nodes — colour by role.
     for role in ("input", "bias", "hidden", "output"):

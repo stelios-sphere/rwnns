@@ -10,7 +10,7 @@ import sys
 
 import torch
 
-from rwnn import build_random_dag
+from rwnn import build_layered_rwnn, build_random_dag
 from rwnn.model import RWNN, RWNNFunction
 
 
@@ -122,6 +122,34 @@ def test_input_grad_matches_reference():
     assert err < 1e-5, f"Input grad mismatch: {err}"
 
 
+def test_layered_depth_is_exact():
+    """build_layered_rwnn should produce exactly n_layers topological levels."""
+    for n_layers in (3, 4, 5, 8):
+        n_nodes = max(n_layers + 5, 20)
+        graph = build_layered_rwnn(
+            n_nodes=n_nodes, edge_prob=0.3, n_layers=n_layers, seed=0,
+        )
+        assert graph.n_levels == n_layers, (
+            f"requested {n_layers} layers, got {graph.n_levels}"
+        )
+    print("[layered depth] all exact")
+
+
+def test_layered_forward_matches_reference():
+    torch.manual_seed(4)
+    device = "cuda"
+    graph = build_layered_rwnn(
+        n_nodes=40, edge_prob=0.25, n_layers=4, seed=5,
+    )
+    net = RWNN(graph, device=device)
+    x = torch.randn(12, graph.n_in, device=device)
+    y_triton = net(x)
+    y_ref = pytorch_reference(graph.to(device), x, net.weights.detach())
+    err = (y_triton - y_ref).abs().max().item()
+    print(f"[layered fwd]  max abs err: {err:.3e}")
+    assert err < 1e-5
+
+
 def test_various_shapes():
     torch.manual_seed(3)
     device = "cuda"
@@ -145,4 +173,6 @@ if __name__ == "__main__":
     test_weight_grad_matches_reference()
     test_input_grad_matches_reference()
     test_various_shapes()
+    test_layered_depth_is_exact()
+    test_layered_forward_matches_reference()
     print("ALL TESTS PASSED")

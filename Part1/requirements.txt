@@ -1,0 +1,4 @@
+torch>=2.3
+triton>=3.0
+numpy
+matplotlib

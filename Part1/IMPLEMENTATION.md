@@ -47,16 +47,24 @@ levels `1 → L_max`. The backward pass is the same sweep in reverse.
 
 ```
 Part1/
-├── README.md              # what the article is about
-├── IMPLEMENTATION.md      # this file — design record
-├── requirements.txt
-├── rwnn/
-│   ├── __init__.py
-│   ├── graph.py           # random DAG builder + CSR + levels
-│   ├── kernels.py         # Triton kernels (custom GPU code)
-│   └── model.py           # autograd.Function + nn.Module
-├── test_kernels.py        # correctness vs. pure-PyTorch reference
-└── train.py               # the Part 1 experiment
+├── README.md                # what the article is about
+├── IMPLEMENTATION.md        # this file — design record
+├── src/
+│   ├── README.md            # agent-facing API/usage guide
+│   ├── requirements.txt
+│   ├── rwnn/
+│   │   ├── __init__.py      # public API
+│   │   ├── graph.py         # two builders + CSR + levels
+│   │   ├── kernels.py       # four Triton GPU kernels
+│   │   └── model.py         # autograd.Function + nn.Module
+│   ├── visualize.py         # networkx architecture + 3D matplotlib
+│   └── tests.py             # correctness vs. pure-PyTorch reference
+└── example/
+    ├── README.md
+    ├── run.py               # reproduces the latest run
+    ├── architecture.png
+    ├── predictions_3d.png
+    └── results.npz
 ```
 
 ## Why Triton, not raw `.cu`

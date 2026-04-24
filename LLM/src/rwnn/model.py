@@ -170,6 +170,10 @@ class RWNN(torch.nn.Module):
         self._n_nodes = graph.n_nodes
         self._n_edges = graph.n_edges
         self._n_levels = graph.n_levels
+        self._n_in = graph.n_in
+        self._n_bias = graph.n_bias
+        self._n_hidden = graph.n_hidden
+        self._n_out = graph.n_out
 
         # Per-destination Xavier-ish weight init: U(-k, +k) with
         # k = sqrt(6 / (fan_in + fan_out_estimate)), but fan_out varies
@@ -217,3 +221,19 @@ class RWNN(torch.nn.Module):
     @property
     def n_levels(self) -> int:
         return self._n_levels
+
+    @property
+    def n_in(self) -> int:
+        return self._n_in
+
+    @property
+    def n_bias(self) -> int:
+        return self._n_bias
+
+    @property
+    def n_hidden(self) -> int:
+        return self._n_hidden
+
+    @property
+    def n_out(self) -> int:
+        return self._n_out

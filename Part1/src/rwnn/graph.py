@@ -243,11 +243,21 @@ def build_layered_rwnn(
     Wiring rules
     ------------
     A node at layer ``L`` draws every node at layers ``< L`` as a
-    candidate parent, keeping each with probability ``edge_prob``. To
-    guarantee the node actually lands at level ``L`` under the longest-
-    path label (``level(i) = 1 + max(level(parents))``), we force at
-    least one parent at layer ``L - 1``. The result is a random DAG
-    whose topological depth is exactly ``n_layers``.
+    candidate parent, keeping each with probability ``edge_prob``.
+
+    Two constraints are then enforced to keep the graph non-degenerate:
+
+    * **Reachable from inputs.** At least one parent at layer ``L - 1``
+      so the longest-path label ``level(i) = 1 + max(level(parents))``
+      places this node at exactly level ``L``.
+    * **Reachable to outputs.** Every non-output node has at least one
+      outgoing edge to some layer ``> L``. Combined with the previous
+      rule, this eliminates "vestigial" nodes — those with no path to
+      any output and therefore zero gradient forever.
+
+    The result is a random DAG whose topological depth is exactly
+    ``n_layers`` and in which every node participates in at least one
+    input-to-output path.
     """
     if n_layers < 2:
         raise ValueError("n_layers must be >= 2 (one layer for inputs/biases, one for outputs)")
@@ -313,5 +323,28 @@ def build_layered_rwnn(
             # happen because layer 0 always has inputs + biases.
             chosen.add(int(rng.integers(0, i)))
         parents[i] = sorted(chosen)
+
+    # Reachable-to-outputs pass. For every non-output node with no
+    # outgoing edge, add one to a uniformly random node at some later
+    # layer. Because output nodes sit at the max layer and already have
+    # at least one parent at L_max - 1, this pass terminates every
+    # forward chain at an output node — no vestigial nodes.
+    children_count = np.zeros(N, dtype=np.int64)
+    for p_list in parents:
+        for p in p_list:
+            children_count[p] += 1
+
+    for i in range(hidden_end):  # inputs + biases + hidden (not outputs)
+        if children_count[i] > 0:
+            continue
+        Li = int(layer[i])
+        later = np.concatenate(
+            [nodes_at_layer[ℓ] for ℓ in range(Li + 1, n_layers)]
+        ) if Li + 1 < n_layers else np.empty(0, dtype=np.int64)
+        if later.size == 0:
+            continue
+        j = int(rng.choice(later))
+        parents[j] = sorted(set(parents[j]) | {i})
+        children_count[i] += 1
 
     return _assemble_dag(n_in, n_bias, n_hidden, n_out, parents)

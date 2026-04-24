@@ -7,6 +7,7 @@
 
 set -u
 cd "$(dirname "$0")"
+export PYTHONUNBUFFERED=1     # stream stdout/stderr in real time through tee
 
 LOG="train.log"
 FAIL_WINDOW=60            # seconds

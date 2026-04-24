@@ -56,12 +56,16 @@ N_LAYERS = 8
 EDGE_PROB = 0.075
 
 BATCH_SIZE = 64
-PEAK_LR = 3e-3
+# LR sized for 66M params. The earlier 3e-3 diverged past step ~2000
+# (above random baseline) because peak was too aggressive for this scale.
+# Standard transformer practice at ~60M is 3e-4 – 1e-3; we go 5e-4 and
+# warm up longer to stay safe.
+PEAK_LR = 5e-4
 MIN_LR = 1e-5
-WARMUP_STEPS = 2000
-COSINE_DECAY_STEPS = 2_000_000   # reach MIN_LR at this step; long plateau after
+WARMUP_STEPS = 4000
+COSINE_DECAY_STEPS = 2_000_000
 GRAD_CLIP = 1.0
-MAX_STEPS = 5_000_000            # "forever" for weekend; stop via Ctrl-C
+MAX_STEPS = 5_000_000
 
 EVAL_INTERVAL_SECONDS = 60.0
 EVAL_ITERS = 40

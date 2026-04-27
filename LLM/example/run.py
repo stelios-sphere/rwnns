@@ -289,19 +289,23 @@ def main():
     # --- one-time architecture metadata dump ---
     arch_json = os.path.join(HERE, "architecture.json")
     if not os.path.exists(arch_json):
+        # Use rwnn_L when parallel (both branches share the same topology
+        # by construction; one is enough for the levels view).
+        ref_rwnn = model.rwnn_L if cfg.parallel else model.rwnn
         per_level = [
-            int(model.rwnn.level_starts[i + 1].item()
-                - model.rwnn.level_starts[i].item())
-            for i in range(model.rwnn.n_levels)
+            int(ref_rwnn.level_starts[i + 1].item()
+                - ref_rwnn.level_starts[i].item())
+            for i in range(ref_rwnn.n_levels)
         ]
         with open(arch_json, "w") as f:
             json.dump({
                 "config": dataclasses.asdict(cfg),
                 "parameters": counts,
                 "rwnn_graph": {
-                    "n_nodes": int(model.rwnn.n_nodes),
-                    "n_edges": int(model.rwnn.n_edges),
-                    "n_levels": int(model.rwnn.n_levels),
+                    "n_nodes": int(ref_rwnn.n_nodes),
+                    "n_edges_per_branch": int(ref_rwnn.n_edges),
+                    "n_branches": 2 if cfg.parallel else 1,
+                    "n_levels": int(ref_rwnn.n_levels),
                     "nodes_per_level": per_level,
                 },
                 "training": {

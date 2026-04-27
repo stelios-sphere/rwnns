@@ -46,6 +46,7 @@ class RWNNFunction(torch.autograd.Function):
         input_ids: torch.Tensor,
         bias_ids: torch.Tensor,
         output_ids: torch.Tensor,
+        node_kinds: torch.Tensor,
         n_nodes: int,
     ) -> torch.Tensor:
         assert x.is_cuda and weights.is_cuda, "RWNN requires CUDA tensors"
@@ -82,6 +83,7 @@ class RWNNFunction(torch.autograd.Function):
                 level_slice,
                 parent_offsets,
                 parent_ids,
+                node_kinds,
                 B,
                 BLOCK_B=_BLOCK_B,
                 ACT=act,
@@ -93,7 +95,7 @@ class RWNNFunction(torch.autograd.Function):
             a, pre, weights,
             parent_offsets, parent_ids, edge_src, edge_dst,
             level_nodes, level_starts, level_is_output,
-            input_ids, output_ids,
+            input_ids, output_ids, node_kinds,
         )
         ctx.B = B
         ctx.N = N
@@ -105,7 +107,7 @@ class RWNNFunction(torch.autograd.Function):
         (a, pre, weights,
          parent_offsets, parent_ids, edge_src, edge_dst,
          level_nodes, level_starts, level_is_output,
-         input_ids, output_ids) = ctx.saved_tensors
+         input_ids, output_ids, node_kinds) = ctx.saved_tensors
         B = ctx.B
         N = ctx.N
         E = ctx.n_edges
@@ -134,8 +136,8 @@ class RWNNFunction(torch.autograd.Function):
                 B, BLOCK_B=_BLOCK_B, ACT=act,
             )
             backward_propagate_kernel[grid](
-                d_a, d_pre, weights, level_slice,
-                parent_offsets, parent_ids,
+                d_a, a, d_pre, weights, level_slice,
+                parent_offsets, parent_ids, node_kinds,
                 B, BLOCK_B=_BLOCK_B,
             )
 
@@ -143,7 +145,9 @@ class RWNNFunction(torch.autograd.Function):
         d_w = torch.zeros(E, device=device, dtype=torch.float32)
         if E > 0:
             backward_weight_kernel[(E,)](
-                a, d_pre, edge_src, edge_dst, d_w,
+                a, d_pre, weights, edge_src, edge_dst,
+                parent_offsets, parent_ids, node_kinds,
+                d_w,
                 B, BLOCK_B=_BLOCK_B,
             )
 
@@ -153,7 +157,7 @@ class RWNNFunction(torch.autograd.Function):
         # Return grads for every argument of forward() in order.
         return (d_x, d_w,
                 None, None, None, None, None, None, None,
-                None, None, None, None)
+                None, None, None, None, None)
 
 
 class RWNN(torch.nn.Module):
@@ -196,6 +200,7 @@ class RWNN(torch.nn.Module):
         self.register_buffer("input_ids", graph.input_ids.contiguous())
         self.register_buffer("bias_ids", graph.bias_ids.contiguous())
         self.register_buffer("output_ids", graph.output_ids.contiguous())
+        self.register_buffer("node_kinds", graph.node_kinds.contiguous())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
@@ -207,6 +212,7 @@ class RWNN(torch.nn.Module):
             self.edge_src, self.edge_dst,
             self.level_nodes, self.level_starts, self.level_is_output,
             self.input_ids, self.bias_ids, self.output_ids,
+            self.node_kinds,
             self._n_nodes,
         )
 

@@ -172,16 +172,23 @@ def draw_architecture(
         _pass(even, +base_rad)
         _pass([not v for v in even], -base_rad)
 
-    # Nodes — colour by role.
+    # Nodes — colour by role; bilinear-gating nodes get a gold ring.
+    node_kinds = getattr(graph, "node_kinds", None)
+    if node_kinds is not None:
+        kinds = node_kinds.tolist() if hasattr(node_kinds, "tolist") else list(node_kinds)
+    else:
+        kinds = [0] * N
     for role in ("input", "bias", "hidden", "output"):
         nodes = [n for n, d in g.nodes(data=True) if d["role"] == role]
         if not nodes:
             continue
+        edge_cols = ["#E5B107" if kinds[n] == 1 else "black" for n in nodes]
+        edge_widths = [2.5 if kinds[n] == 1 else 1.0 for n in nodes]
         nx.draw_networkx_nodes(
             g, pos, nodelist=nodes, ax=ax,
             node_color=_color_for(role),
             node_size=node_size,
-            edgecolors="black", linewidths=1.0,
+            edgecolors=edge_cols, linewidths=edge_widths,
         )
 
     if show_labels:
@@ -205,6 +212,12 @@ def draw_architecture(
         plt.Line2D([0], [0], color="#2E6FB7", linewidth=2, label="w > 0"),
         plt.Line2D([0], [0], color="#C0392B", linewidth=2, label="w < 0"),
     ]
+    if node_kinds is not None and any(k == 1 for k in kinds):
+        handles.append(plt.Line2D([0], [0], marker="o", color="w",
+                                  markerfacecolor=HIDDEN_COLOR,
+                                  markeredgecolor="#E5B107",
+                                  markeredgewidth=2.5, markersize=12,
+                                  label="bilinear gate"))
     ax.legend(handles=handles, loc="upper left", framealpha=0.9,
               fontsize=9, ncols=3)
 

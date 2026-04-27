@@ -61,6 +61,11 @@ class RandomDAG:
     # Per-node fan-in, handy for weight init.
     fan_in: torch.Tensor          # int32 [N]
 
+    # Per-node kind. 0 = LINEAR, 1 = BILINEAR (gating). Bilinear nodes
+    # have an even number of parents paired as (gate, value); they
+    # compute  tanh( Σ_pairs σ(w_g · a_g) · w_v · a_v ).
+    node_kinds: torch.Tensor      # int8 [N]
+
     # Convenience.
     input_ids: torch.Tensor       # int32 [n_in]
     bias_ids: torch.Tensor        # int32 [n_bias]
@@ -95,8 +100,13 @@ def _assemble_dag(
     n_hidden: int,
     n_out: int,
     parents: List[List[int]],
+    node_kinds: np.ndarray | None = None,
 ) -> RandomDAG:
-    """Pack per-node parent lists into CSR + levels + edge tables."""
+    """Pack per-node parent lists into CSR + levels + edge tables.
+
+    ``node_kinds`` is an int8 array of length N, with 0 = LINEAR (default)
+    and 1 = BILINEAR. If None, all nodes are LINEAR.
+    """
     N = n_in + n_bias + n_hidden + n_out
     inputs_end = n_in
     bias_end = n_in + n_bias
@@ -147,6 +157,12 @@ def _assemble_dag(
     def t(a, dtype=torch.int32):
         return torch.as_tensor(a, dtype=dtype)
 
+    if node_kinds is None:
+        node_kinds_np = np.zeros(N, dtype=np.int8)
+    else:
+        node_kinds_np = np.asarray(node_kinds, dtype=np.int8)
+        assert node_kinds_np.shape == (N,)
+
     return RandomDAG(
         n_in=n_in,
         n_bias=n_bias,
@@ -160,6 +176,7 @@ def _assemble_dag(
         level_starts=t(level_starts_np),
         level_is_output=torch.as_tensor(level_is_output_np),
         fan_in=t(fan_in_np),
+        node_kinds=torch.as_tensor(node_kinds_np, dtype=torch.int8),
         input_ids=t(np.arange(0, inputs_end, dtype=np.int64)),
         bias_ids=t(np.arange(inputs_end, bias_end, dtype=np.int64)),
         output_ids=t(np.arange(hidden_end, N, dtype=np.int64)),
@@ -221,6 +238,7 @@ def build_layered_rwnn(
     n_bias: int = 2,
     n_out: int = 1,
     seed: int | None = None,
+    bilinear_fraction: float = 0.0,
 ) -> RandomDAG:
     """Random DAG with a user-specified number of topological levels.
 
@@ -258,6 +276,18 @@ def build_layered_rwnn(
     The result is a random DAG whose topological depth is exactly
     ``n_layers`` and in which every node participates in at least one
     input-to-output path.
+
+    Bilinear gating nodes
+    ---------------------
+    If ``bilinear_fraction > 0``, that fraction of compute nodes
+    (hidden + output) are randomly designated as **bilinear gating
+    nodes**. They have an even number of parents paired in CSR order
+    as (gate, value); each pair contributes
+    ``σ(w_g · a_gate) · w_v · a_value`` to the node's pre-activation,
+    which is then ``tanh``'d like a linear node. After pair adjustment
+    every bilinear node has at least one (gate, value) pair, with at
+    least one pair pointing back to layer ``L - 1`` to preserve the
+    longest-path placement.
     """
     if n_layers < 2:
         raise ValueError("n_layers must be >= 2 (one layer for inputs/biases, one for outputs)")
@@ -347,4 +377,38 @@ def build_layered_rwnn(
         parents[j] = sorted(set(parents[j]) | {i})
         children_count[i] += 1
 
-    return _assemble_dag(n_in, n_bias, n_hidden, n_out, parents)
+    # Bilinear node-kind assignment (Option A: random, fixed fraction).
+    # Each compute node (hidden + output) is independently bilinear with
+    # probability bilinear_fraction. Bilinear nodes need an even parent
+    # count; if they have an odd count we pad with one extra random
+    # earlier-layer parent that preserves the layer-(L-1) invariant.
+    node_kinds = np.zeros(N, dtype=np.int8)
+    if bilinear_fraction > 0.0:
+        for i in range(bias_end, N):
+            if rng.random() < bilinear_fraction:
+                # Need at least 2 parents to form one (gate, value) pair.
+                if len(parents[i]) < 2:
+                    Li = int(layer[i])
+                    cand = np.concatenate(
+                        [nodes_at_layer[ℓ] for ℓ in range(Li)]
+                    )
+                    cand = cand[~np.isin(cand, parents[i])]
+                    if cand.size == 0:
+                        # Skip — can't make this node bilinear meaningfully.
+                        continue
+                    parents[i] = sorted(set(parents[i]) | {int(rng.choice(cand))})
+                # Even parent count for clean pairing.
+                if len(parents[i]) % 2 == 1:
+                    Li = int(layer[i])
+                    cand = np.concatenate(
+                        [nodes_at_layer[ℓ] for ℓ in range(Li)]
+                    )
+                    cand = cand[~np.isin(cand, parents[i])]
+                    if cand.size == 0:
+                        # Drop one to make even.
+                        parents[i] = parents[i][:-1]
+                    else:
+                        parents[i] = sorted(set(parents[i]) | {int(rng.choice(cand))})
+                node_kinds[i] = 1
+
+    return _assemble_dag(n_in, n_bias, n_hidden, n_out, parents, node_kinds)

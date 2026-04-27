@@ -44,8 +44,12 @@ from tokenizer import BPETokenizer              # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Config — ~66M params, RWNN 96%
+# Config — ~66M params, RWNN 96%, with 5% bilinear gating nodes
 # ---------------------------------------------------------------------------
+DATA_TRAIN = "TinyStories-train.txt"
+DATA_VAL = "TinyStories-valid.txt"
+BPE_TRAIN_BYTES = 80 * 1024 * 1024   # train BPE on first 80 MB only (speed)
+
 VOCAB_SIZE = 1024
 CONTEXT_LENGTH = 128
 D_MODEL = 48
@@ -54,6 +58,7 @@ N_OUT_RWNN = 384
 N_NODES = 45000
 N_LAYERS = 8
 EDGE_PROB = 0.075
+BILINEAR_FRACTION = 0.05   # ~5% of compute nodes are bilinear gates
 
 BATCH_SIZE = 64
 # LR sized for 66M params. The earlier 3e-3 diverged past step ~2000
@@ -207,11 +212,18 @@ def main():
     val_cache = os.path.join(HERE, "val_ids.pt")
 
     # --- corpus + tokenizer ---
-    with open(os.path.join(DATA, "tinyshakespeare.txt")) as f:
-        text = f.read()
-    split = int(0.9 * len(text))
-    train_text, val_text = text[:split], text[split:]
-    tok = load_or_build_tokenizer(train_text, tok_path)
+    train_path = os.path.join(DATA, DATA_TRAIN)
+    val_path = os.path.join(DATA, DATA_VAL)
+    with open(train_path) as f:
+        train_text = f.read()
+    with open(val_path) as f:
+        val_text = f.read()
+    print(f"corpus: train={len(train_text):,} chars, val={len(val_text):,} chars")
+    # Train BPE on a head subset of the train file for speed; this gives a
+    # representative vocab without scanning all 2.6 GB.
+    bpe_subset = train_text[: min(BPE_TRAIN_BYTES, len(train_text))]
+    print(f"training BPE on {len(bpe_subset):,}-char subset of train")
+    tok = load_or_build_tokenizer(bpe_subset, tok_path)
     train_ids = load_or_encode_corpus(tok, train_text, train_cache, device)
     val_ids = load_or_encode_corpus(tok, val_text, val_cache, device)
 
@@ -225,6 +237,7 @@ def main():
         n_nodes=N_NODES,
         n_layers=N_LAYERS,
         edge_prob=EDGE_PROB,
+        bilinear_fraction=BILINEAR_FRACTION,
         seed=SEED,
     )
     model, opt, start_step, best_val, best_step, history = resume_or_fresh(

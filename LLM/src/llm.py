@@ -48,6 +48,7 @@ class RWNNLMConfig:
     n_nodes: int = 1500             # total RWNN nodes (incl. in + bias + hidden + out)
     n_layers: int = 5               # RWNN topological depth
     edge_prob: float = 0.03         # RWNN connection density
+    bilinear_fraction: float = 0.0  # fraction of compute nodes that are bilinear gates
     n_bias: int = 2                 # bias nodes inside RWNN
     seed: int = 0
 
@@ -67,6 +68,7 @@ class RWNNLM(nn.Module):
             n_bias=cfg.n_bias,
             n_out=cfg.n_out_rwnn,
             seed=cfg.seed,
+            bilinear_fraction=cfg.bilinear_fraction,
         )
         self.rwnn = RWNN(graph, device=self.device)
 

@@ -84,24 +84,24 @@ def draw_architecture(
     title: str | None = None,
     node_size: int | None = None,
     show_labels: bool | None = None,
+    max_edges_to_draw: int = 20_000,
 ) -> None:
-    """Render the DAG with networkx, coloured / sized like the blog post."""
+    """Render the DAG with networkx / matplotlib.
+
+    Two render modes, chosen automatically by edge count:
+
+    - ``E <= max_edges_to_draw`` : per-edge ``FancyArrowPatch`` with
+      arc curvature (pretty but O(E) matplotlib patches).
+    - ``E >  max_edges_to_draw`` : single ``LineCollection`` over a
+      uniformly-sampled edge subset (straight lines). Scales to millions
+      of edges. The layer-to-layer density pattern is preserved.
+    """
     if isinstance(weights, torch.Tensor):
         weights = weights.detach().cpu().numpy()
 
-    # Build the networkx graph.
-    g = nx.DiGraph()
-    for n in range(graph.n_nodes):
-        g.add_node(int(n), role=_role_of(int(n), graph))
-    edge_src = graph.edge_src.tolist()
-    edge_dst = graph.edge_dst.tolist()
-    for e in range(len(edge_src)):
-        g.add_edge(int(edge_src[e]), int(edge_dst[e]), weight=float(weights[e]))
-
     pos = layered_positions(graph)
-
-    # Size/label heuristics scale down for large graphs.
     N = graph.n_nodes
+    E = graph.n_edges
     if node_size is None:
         node_size = 500 if N <= 40 else max(20, int(4000 / N))
     if show_labels is None:
@@ -111,50 +111,84 @@ def draw_architecture(
     for ℓ in range(graph.n_levels):
         ax.axvline(ℓ, color="#DDDDDD", linewidth=0.8, zorder=0)
 
-    # Edges — styled by sign + magnitude, drawn with curvature so many
-    # parallel edges between the same two columns don't collapse onto
-    # the same line. Two passes with opposite curvature, split by edge
-    # index parity, spread them out visually.
-    edges_list = list(g.edges())
-    w_arr = np.array([g.edges[e]["weight"] for e in edges_list])
-    w_abs = np.abs(w_arr)
-    w_max = float(w_abs.max()) if w_abs.size else 1.0
-    widths = 0.3 + 2.5 * (w_abs / (w_max + 1e-12))
-    edge_colors = ["#2E6FB7" if w >= 0 else "#C0392B" for w in w_arr]
+    edge_src = np.asarray(graph.edge_src.tolist(), dtype=np.int64)
+    edge_dst = np.asarray(graph.edge_dst.tolist(), dtype=np.int64)
+    w_arr = np.asarray(weights, dtype=np.float32)
 
-    # Scale curvature down for wider graphs so the bend isn't excessive.
-    base_rad = 0.18 if graph.n_levels <= 6 else 0.12
+    subtitle_suffix = ""
+    if E > max_edges_to_draw:
+        # ----- fast straight-line mode -----
+        from matplotlib.collections import LineCollection
+        rng = np.random.default_rng(0)
+        idx = rng.choice(E, size=max_edges_to_draw, replace=False)
+        srcs = edge_src[idx]
+        dsts = edge_dst[idx]
+        ws = w_arr[idx]
+        pts_src = np.array([[pos[int(s)][0], pos[int(s)][1]] for s in srcs])
+        pts_dst = np.array([[pos[int(d)][0], pos[int(d)][1]] for d in dsts])
+        segs = np.stack([pts_src, pts_dst], axis=1)
+        w_max = float(np.abs(ws).max()) if ws.size else 1.0
+        widths = 0.15 + 1.2 * (np.abs(ws) / (w_max + 1e-12))
+        colors = np.where(ws >= 0, "#2E6FB7", "#C0392B")
+        lc = LineCollection(segs, colors=colors.tolist(), linewidths=widths,
+                            alpha=0.3, zorder=1)
+        ax.add_collection(lc)
+        subtitle_suffix = f"  (subsample: {max_edges_to_draw:,} / {E:,} edges)"
+        # build a minimal networkx graph just for node drawing
+        g = nx.DiGraph()
+        for n in range(N):
+            g.add_node(int(n), role=_role_of(int(n), graph))
+    else:
+        # ----- curved-arrow mode -----
+        g = nx.DiGraph()
+        for n in range(N):
+            g.add_node(int(n), role=_role_of(int(n), graph))
+        edges_list = []
+        for e in range(E):
+            g.add_edge(int(edge_src[e]), int(edge_dst[e]),
+                       weight=float(w_arr[e]))
+            edges_list.append((int(edge_src[e]), int(edge_dst[e])))
+        w_abs = np.abs(w_arr)
+        w_max = float(w_abs.max()) if w_abs.size else 1.0
+        widths = 0.3 + 2.5 * (w_abs / (w_max + 1e-12))
+        edge_colors = ["#2E6FB7" if w >= 0 else "#C0392B" for w in w_arr]
+        base_rad = 0.18 if graph.n_levels <= 6 else 0.12
 
-    def _pass(mask, rad):
-        if not any(mask):
-            return
-        nx.draw_networkx_edges(
-            g, pos, ax=ax,
-            edgelist=[e for e, m in zip(edges_list, mask) if m],
-            edge_color=[c for c, m in zip(edge_colors, mask) if m],
-            width=[w for w, m in zip(widths, mask) if m],
-            alpha=0.6,
-            arrows=True,          # required for connectionstyle to take effect
-            arrowstyle="-",       # no arrowhead — feed-forward is obvious
-            connectionstyle=f"arc3,rad={rad}",
-            node_size=node_size,  # so the curve starts at the node edge
-        )
+        def _pass(mask, rad):
+            if not any(mask):
+                return
+            nx.draw_networkx_edges(
+                g, pos, ax=ax,
+                edgelist=[e for e, m in zip(edges_list, mask) if m],
+                edge_color=[c for c, m in zip(edge_colors, mask) if m],
+                width=[w for w, m in zip(widths, mask) if m],
+                alpha=0.6,
+                arrows=True,
+                arrowstyle="-",
+                connectionstyle=f"arc3,rad={rad}",
+                node_size=node_size,
+            )
+        even = [i % 2 == 0 for i in range(len(edges_list))]
+        _pass(even, +base_rad)
+        _pass([not v for v in even], -base_rad)
 
-    even = [i % 2 == 0 for i in range(len(edges_list))]
-    odd = [not v for v in even]
-    _pass(even, +base_rad)
-    _pass(odd, -base_rad)
-
-    # Nodes — colour by role.
+    # Nodes — colour by role; bilinear-gating nodes get a gold ring.
+    node_kinds = getattr(graph, "node_kinds", None)
+    if node_kinds is not None:
+        kinds = node_kinds.tolist() if hasattr(node_kinds, "tolist") else list(node_kinds)
+    else:
+        kinds = [0] * N
     for role in ("input", "bias", "hidden", "output"):
         nodes = [n for n, d in g.nodes(data=True) if d["role"] == role]
         if not nodes:
             continue
+        edge_cols = ["#E5B107" if kinds[n] == 1 else "black" for n in nodes]
+        edge_widths = [2.5 if kinds[n] == 1 else 1.0 for n in nodes]
         nx.draw_networkx_nodes(
             g, pos, nodelist=nodes, ax=ax,
             node_color=_color_for(role),
             node_size=node_size,
-            edgecolors="black", linewidths=1.0,
+            edgecolors=edge_cols, linewidths=edge_widths,
         )
 
     if show_labels:
@@ -178,6 +212,12 @@ def draw_architecture(
         plt.Line2D([0], [0], color="#2E6FB7", linewidth=2, label="w > 0"),
         plt.Line2D([0], [0], color="#C0392B", linewidth=2, label="w < 0"),
     ]
+    if node_kinds is not None and any(k == 1 for k in kinds):
+        handles.append(plt.Line2D([0], [0], marker="o", color="w",
+                                  markerfacecolor=HIDDEN_COLOR,
+                                  markeredgecolor="#E5B107",
+                                  markeredgewidth=2.5, markersize=12,
+                                  label="bilinear gate"))
     ax.legend(handles=handles, loc="upper left", framealpha=0.9,
               fontsize=9, ncols=3)
 

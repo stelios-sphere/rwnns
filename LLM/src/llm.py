@@ -81,8 +81,15 @@ class RWNNLM(nn.Module):
         )
         self.rwnn = RWNN(graph, device=self.device)
 
-        # Token embedding only — no projection layers.
+        # Token embedding + learnable absolute positional embedding.
+        # Without positional embeddings, two tokens of the same id at
+        # different positions have identical 48-dim embeddings; the
+        # only positional signal reaches the RWNN through *which* input
+        # nodes a value lands at — easy to wash out under random
+        # connectivity. Adding a per-position learnable vector gives
+        # each (position, dim) input node a unique signature.
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.context_length, cfg.d_model)
 
         self.to(self.device)
 
@@ -97,9 +104,10 @@ class RWNNLM(nn.Module):
         assert T == self.cfg.context_length, (
             f"context_length mismatch: model={self.cfg.context_length}, got T={T}"
         )
-        emb = self.token_emb(ids)                    # [B, T, d_model]
-        flat = emb.reshape(B, T * self.cfg.d_model)  # [B, n_in]
-        logits = self.rwnn(flat)                     # [B, V]
+        positions = torch.arange(T, device=ids.device)
+        emb = self.token_emb(ids) + self.pos_emb(positions)  # [B, T, d_model]
+        flat = emb.reshape(B, T * self.cfg.d_model)          # [B, n_in]
+        logits = self.rwnn(flat)                             # [B, V]
         return logits
 
     # ------------------------------------------------------------------
@@ -153,10 +161,12 @@ class RWNNLM(nn.Module):
     # ------------------------------------------------------------------
 
     def num_parameters(self) -> dict[str, int]:
-        emb = self.token_emb.weight.numel()
+        tok = self.token_emb.weight.numel()
+        pos = self.pos_emb.weight.numel()
         rwnn_p = self.rwnn.weights.numel()
         return {
-            "embedding": emb,
+            "token_embedding": tok,
+            "pos_embedding": pos,
             "rwnn": rwnn_p,
-            "total": emb + rwnn_p,
+            "total": tok + pos + rwnn_p,
         }

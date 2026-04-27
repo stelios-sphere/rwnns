@@ -253,7 +253,9 @@ def main():
     )
     counts = model.num_parameters()
     print(f"model: total={counts['total']:,}  "
-          f"emb={counts['embedding']:,}  rwnn={counts['rwnn']:,} "
+          f"tok_emb={counts['token_embedding']:,}  "
+          f"pos_emb={counts['pos_embedding']:,}  "
+          f"rwnn={counts['rwnn']:,} "
           f"({counts['rwnn']/counts['total']*100:.0f}%)")
     print(f"rwnn graph: n_in={model.rwnn.n_in} (= ctx*d_model), "
           f"n_out={model.rwnn.n_out} (= vocab), "

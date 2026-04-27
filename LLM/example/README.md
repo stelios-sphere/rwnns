@@ -2,11 +2,11 @@
 
 End-to-end training of the RWNN-LLM on Microsoft's TinyStories corpus.
 
-## Architecture (no projection layers)
+## Architecture (no projection layers, with positional embeddings)
 
 ```
 ids   [B, T]                                 T = 128 BPE tokens
-  │   token_emb (V × d_model)
+  │   token_emb (V × d_model)  +  pos_emb (T × d_model)
   ▼
 emb   [B, T, d_model]                        d_model = 48
   │   flatten
@@ -21,6 +21,14 @@ Every (token-position, embedding-dim) pair is its own input node;
 every vocab entry is its own output node. **No `in_proj` / `out_proj`
 linear layers** — the embedding feeds the random graph directly, and
 the random graph's outputs are the logits.
+
+A learnable per-position embedding is added to the token embedding
+before flattening, so each (position, dim) input node carries a unique
+positional signature in addition to its token's content. Without this,
+two identical tokens at different positions produced identical
+embeddings, and the only positional signal the RWNN had was *which*
+input nodes a value lands at — easy to wash out under random
+connectivity.
 
 Default config (`run.py`):
 

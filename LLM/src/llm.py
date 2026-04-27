@@ -54,6 +54,11 @@ class RWNNLMConfig:
     # by gradient descent. "sinusoidal" = the closed-form Vaswani-2017 table,
     # parameter-free and extrapolates to longer contexts at inference.
     pos_encoding: str = "learned"
+    # Architecture: single RWNN, or two parallel mirror RWNNs (one all-linear,
+    # one all-bilinear) with the same topology, summed at the output. When
+    # parallel=True, ``bilinear_fraction`` is ignored — the linear branch is
+    # 0%, the bilinear branch is 100%.
+    parallel: bool = False
 
 
 class RWNNLM(nn.Module):
@@ -74,17 +79,42 @@ class RWNNLM(nn.Module):
                 f"n_out={n_out} + 1 hidden)"
             )
 
-        graph = build_layered_rwnn(
-            n_nodes=cfg.n_nodes,
-            edge_prob=cfg.edge_prob,
-            n_layers=cfg.n_layers,
-            n_in=n_in,
-            n_bias=cfg.n_bias,
-            n_out=n_out,
-            seed=cfg.seed,
-            bilinear_fraction=cfg.bilinear_fraction,
-        )
-        self.rwnn = RWNN(graph, device=self.device)
+        if cfg.parallel:
+            # Two RWNNs of identical topology, one all-linear and one all-
+            # bilinear. They share only the input embedding and merge at the
+            # output by summation. Same seed → identical edge sets;
+            # bilinear_fraction differs so node kinds are complementary.
+            graph_L = build_layered_rwnn(
+                n_nodes=cfg.n_nodes, edge_prob=cfg.edge_prob,
+                n_layers=cfg.n_layers, n_in=n_in,
+                n_bias=cfg.n_bias, n_out=n_out,
+                seed=cfg.seed, bilinear_fraction=0.0,
+            )
+            graph_B = build_layered_rwnn(
+                n_nodes=cfg.n_nodes, edge_prob=cfg.edge_prob,
+                n_layers=cfg.n_layers, n_in=n_in,
+                n_bias=cfg.n_bias, n_out=n_out,
+                seed=cfg.seed, bilinear_fraction=1.0,
+            )
+            self.rwnn_L = RWNN(graph_L, device=self.device)
+            self.rwnn_B = RWNN(graph_B, device=self.device)
+            # Scale each branch's weights by 1/√2 so the summed output has
+            # variance comparable to a single-branch network's output.
+            with torch.no_grad():
+                self.rwnn_L.weights.mul_(1.0 / math.sqrt(2.0))
+                self.rwnn_B.weights.mul_(1.0 / math.sqrt(2.0))
+        else:
+            graph = build_layered_rwnn(
+                n_nodes=cfg.n_nodes,
+                edge_prob=cfg.edge_prob,
+                n_layers=cfg.n_layers,
+                n_in=n_in,
+                n_bias=cfg.n_bias,
+                n_out=n_out,
+                seed=cfg.seed,
+                bilinear_fraction=cfg.bilinear_fraction,
+            )
+            self.rwnn = RWNN(graph, device=self.device)
 
         # Token embedding + per-position offset. Without a positional signal,
         # two tokens of the same id at different positions have identical
@@ -130,7 +160,10 @@ class RWNNLM(nn.Module):
             pos = self.pos_emb(positions)     # [T, d_model]
         emb = self.token_emb(ids) + pos                       # broadcasts over B
         flat = emb.reshape(B, T * self.cfg.d_model)           # [B, n_in]
-        logits = self.rwnn(flat)                              # [B, V]
+        if self.cfg.parallel:
+            logits = self.rwnn_L(flat) + self.rwnn_B(flat)    # [B, V]
+        else:
+            logits = self.rwnn(flat)                          # [B, V]
         return logits
 
     # ------------------------------------------------------------------
@@ -186,10 +219,22 @@ class RWNNLM(nn.Module):
     def num_parameters(self) -> dict[str, int]:
         tok = self.token_emb.weight.numel()
         pos = 0 if self._sinusoidal else self.pos_emb.weight.numel()
+        if self.cfg.parallel:
+            rwnn_L_p = self.rwnn_L.weights.numel()
+            rwnn_B_p = self.rwnn_B.weights.numel()
+            rwnn_p = rwnn_L_p + rwnn_B_p
+            return {
+                "token_embedding": tok,
+                "pos_embedding": pos,
+                "rwnn_L": rwnn_L_p,
+                "rwnn_B": rwnn_B_p,
+                "rwnn": rwnn_p,          # combined linear + bilinear
+                "total": tok + pos + rwnn_p,
+            }
         rwnn_p = self.rwnn.weights.numel()
         return {
             "token_embedding": tok,
-            "pos_embedding": pos,    # 0 for sinusoidal (non-learnable buffer)
+            "pos_embedding": pos,
             "rwnn": rwnn_p,
             "total": tok + pos + rwnn_p,
         }

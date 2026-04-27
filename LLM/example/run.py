@@ -66,15 +66,17 @@ D_MODEL = 48
 N_NODES = 80000
 N_LAYERS = 8
 EDGE_PROB = 0.030
-BILINEAR_FRACTION = 0.05    # ~5% of compute nodes are bilinear gates
-POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal" — see llm.py
+BILINEAR_FRACTION = 0.05    # ignored when PARALLEL is True (see llm.py)
+POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal"
+PARALLEL = True             # two parallel mirror RWNNs: one all-linear, one
+                            # all-bilinear, summed at the output (logits = L + B)
 
 BATCH_SIZE = 64
 # LR sized for 66M params. The earlier 3e-3 diverged past step ~2000
 # (above random baseline) because peak was too aggressive for this scale.
 # Standard transformer practice at ~60M is 3e-4 – 1e-3; we go 5e-4 and
 # warm up longer to stay safe.
-PEAK_LR = 5e-4
+PEAK_LR = 2e-4
 MIN_LR = 1e-5
 WARMUP_STEPS = 4000
 COSINE_DECAY_STEPS = 2_000_000
@@ -254,21 +256,35 @@ def main():
         edge_prob=EDGE_PROB,
         bilinear_fraction=BILINEAR_FRACTION,
         pos_encoding=POS_ENCODING,
+        parallel=PARALLEL,
         seed=SEED,
     )
     model, opt, start_step, best_val, best_step, history = resume_or_fresh(
         cfg, device, latest_path, best_path
     )
     counts = model.num_parameters()
-    print(f"model: total={counts['total']:,}  "
-          f"tok_emb={counts['token_embedding']:,}  "
-          f"pos_emb={counts['pos_embedding']:,}  "
-          f"rwnn={counts['rwnn']:,} "
-          f"({counts['rwnn']/counts['total']*100:.0f}%)")
-    print(f"rwnn graph: n_in={model.rwnn.n_in} (= ctx*d_model), "
-          f"n_out={model.rwnn.n_out} (= vocab), "
-          f"{model.rwnn.n_nodes} nodes, {model.rwnn.n_edges:,} edges, "
-          f"{model.rwnn.n_levels} levels")
+    if cfg.parallel:
+        print(f"model: total={counts['total']:,}  "
+              f"tok_emb={counts['token_embedding']:,}  "
+              f"pos_emb={counts['pos_embedding']:,}  "
+              f"rwnn_L={counts['rwnn_L']:,}  rwnn_B={counts['rwnn_B']:,}  "
+              f"rwnn_total={counts['rwnn']:,} "
+              f"({counts['rwnn']/counts['total']*100:.0f}%)")
+        print(f"rwnn (each branch): n_in={model.rwnn_L.n_in} (= ctx*d_model), "
+              f"n_out={model.rwnn_L.n_out} (= vocab), "
+              f"{model.rwnn_L.n_nodes} nodes, "
+              f"{model.rwnn_L.n_edges:,} (L) + {model.rwnn_B.n_edges:,} (B) edges, "
+              f"{model.rwnn_L.n_levels} levels")
+    else:
+        print(f"model: total={counts['total']:,}  "
+              f"tok_emb={counts['token_embedding']:,}  "
+              f"pos_emb={counts['pos_embedding']:,}  "
+              f"rwnn={counts['rwnn']:,} "
+              f"({counts['rwnn']/counts['total']*100:.0f}%)")
+        print(f"rwnn graph: n_in={model.rwnn.n_in} (= ctx*d_model), "
+              f"n_out={model.rwnn.n_out} (= vocab), "
+              f"{model.rwnn.n_nodes} nodes, {model.rwnn.n_edges:,} edges, "
+              f"{model.rwnn.n_levels} levels")
 
     # --- one-time architecture metadata dump ---
     arch_json = os.path.join(HERE, "architecture.json")

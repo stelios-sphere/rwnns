@@ -2,18 +2,21 @@
 
 End-to-end training of the RWNN-LLM on Microsoft's TinyStories corpus.
 
-## Architecture (no projection layers, with positional embeddings)
+## Architecture: parallel mirrors (linear + bilinear), no projection layers, sinusoidal positional encoding
 
 ```
-ids   [B, T]                                 T = 128 BPE tokens
+ids   [B, T]                                 T = 1024 BPE tokens
   │   token_emb (V × d_model)  +  pos_emb (T × d_model)
   ▼
 emb   [B, T, d_model]                        d_model = 48
   │   flatten
   ▼
-flat  [B, T·d_model]                         RWNN input  n_in  = 6,144
-  │   RWNN (random DAG, tanh hidden, linear output)
-  ▼
+flat  [B, T·d_model]                         RWNN input  n_in  = 49,152
+  │
+  ├─► RWNN_L  (all-linear, same topology)   ──► logits_L [B, V]
+  └─► RWNN_B  (all-bilinear, same topology) ──► logits_B [B, V]
+                                                    │
+                                                    ▼  (sum)
 logits[B, V]                                 RWNN output n_out = 1,024
 ```
 

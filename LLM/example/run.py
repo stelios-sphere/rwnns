@@ -46,8 +46,8 @@ from tokenizer import BPETokenizer              # noqa: E402
 # ---------------------------------------------------------------------------
 # Config — ~66M params, RWNN 96%, with 5% bilinear gating nodes
 # ---------------------------------------------------------------------------
-DATA_TRAIN = "TinyStories-train.txt"
-DATA_VAL = "TinyStories-valid.txt"
+DATA_TRAIN = "WikiText-103-train.txt"
+DATA_VAL = "WikiText-103-valid.txt"
 BPE_TRAIN_BYTES = 80 * 1024 * 1024   # train BPE on first 80 MB only (speed)
 
 VOCAB_SIZE = 1024

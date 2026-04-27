@@ -1,6 +1,12 @@
 # `LLM/example/` — TinyStories training run
 
-End-to-end training of the RWNN-LLM on Microsoft's TinyStories corpus.
+End-to-end training of the RWNN-LLM on **Salesforce's WikiText-103-raw**
+corpus (long-form Wikipedia articles; ~515 MB raw text, ~100 M BPE
+tokens at our vocab). At ctx=1024 each training window is a coherent
+chunk of an article, suitable for long-context training. Earlier
+iterations used Microsoft TinyStories which was a better fit for
+ctx ≤ 256 but left most of a 1024-token context filled with concatenated
+unrelated stories.
 
 ## Architecture: parallel mirrors (linear + bilinear), no projection layers, sinusoidal positional encoding
 

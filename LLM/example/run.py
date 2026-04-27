@@ -60,7 +60,8 @@ D_MODEL = 48
 N_NODES = 45000
 N_LAYERS = 8
 EDGE_PROB = 0.075
-BILINEAR_FRACTION = 0.05   # ~5% of compute nodes are bilinear gates
+BILINEAR_FRACTION = 0.05    # ~5% of compute nodes are bilinear gates
+POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal" — see llm.py
 
 BATCH_SIZE = 64
 # LR sized for 66M params. The earlier 3e-3 diverged past step ~2000
@@ -246,6 +247,7 @@ def main():
         n_layers=N_LAYERS,
         edge_prob=EDGE_PROB,
         bilinear_fraction=BILINEAR_FRACTION,
+        pos_encoding=POS_ENCODING,
         seed=SEED,
     )
     model, opt, start_step, best_val, best_step, history = resume_or_fresh(

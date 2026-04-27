@@ -29,6 +29,7 @@ maintain a rolling context of the last T tokens and sample step-by-step.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -49,6 +50,10 @@ class RWNNLMConfig:
     bilinear_fraction: float = 0.0  # fraction of compute nodes that are bilinear gates
     n_bias: int = 2                 # bias nodes inside RWNN
     seed: int = 0
+    # Positional encoding scheme. "learned" = nn.Embedding(T, d_model), trained
+    # by gradient descent. "sinusoidal" = the closed-form Vaswani-2017 table,
+    # parameter-free and extrapolates to longer contexts at inference.
+    pos_encoding: str = "learned"
 
 
 class RWNNLM(nn.Module):
@@ -81,15 +86,29 @@ class RWNNLM(nn.Module):
         )
         self.rwnn = RWNN(graph, device=self.device)
 
-        # Token embedding + learnable absolute positional embedding.
-        # Without positional embeddings, two tokens of the same id at
-        # different positions have identical 48-dim embeddings; the
-        # only positional signal reaches the RWNN through *which* input
-        # nodes a value lands at — easy to wash out under random
-        # connectivity. Adding a per-position learnable vector gives
-        # each (position, dim) input node a unique signature.
+        # Token embedding + per-position offset. Without a positional signal,
+        # two tokens of the same id at different positions have identical
+        # d_model vectors; under random connectivity the only positional
+        # information (the slot index in the flattened input) gets washed
+        # out. The pos table gives each (position, dim) input node a unique
+        # additive signature.
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_emb = nn.Embedding(cfg.context_length, cfg.d_model)
+
+        if cfg.pos_encoding == "learned":
+            # Trainable [T, d_model] embedding.
+            self.pos_emb = nn.Embedding(cfg.context_length, cfg.d_model)
+            self._sinusoidal = False
+        elif cfg.pos_encoding == "sinusoidal":
+            # Vaswani-2017 closed form: even dims = sin, odd dims = cos,
+            # at log-spaced frequencies. Non-learnable buffer; zero params.
+            pe = _build_sinusoidal_table(cfg.context_length, cfg.d_model)
+            self.register_buffer("pos_emb_table", pe)
+            self._sinusoidal = True
+        else:
+            raise ValueError(
+                f"pos_encoding must be 'learned' or 'sinusoidal', "
+                f"got {cfg.pos_encoding!r}"
+            )
 
         self.to(self.device)
 
@@ -104,10 +123,14 @@ class RWNNLM(nn.Module):
         assert T == self.cfg.context_length, (
             f"context_length mismatch: model={self.cfg.context_length}, got T={T}"
         )
-        positions = torch.arange(T, device=ids.device)
-        emb = self.token_emb(ids) + self.pos_emb(positions)  # [B, T, d_model]
-        flat = emb.reshape(B, T * self.cfg.d_model)          # [B, n_in]
-        logits = self.rwnn(flat)                             # [B, V]
+        if self._sinusoidal:
+            pos = self.pos_emb_table          # [T, d_model], on device via buffer
+        else:
+            positions = torch.arange(T, device=ids.device)
+            pos = self.pos_emb(positions)     # [T, d_model]
+        emb = self.token_emb(ids) + pos                       # broadcasts over B
+        flat = emb.reshape(B, T * self.cfg.d_model)           # [B, n_in]
+        logits = self.rwnn(flat)                              # [B, V]
         return logits
 
     # ------------------------------------------------------------------
@@ -162,11 +185,33 @@ class RWNNLM(nn.Module):
 
     def num_parameters(self) -> dict[str, int]:
         tok = self.token_emb.weight.numel()
-        pos = self.pos_emb.weight.numel()
+        pos = 0 if self._sinusoidal else self.pos_emb.weight.numel()
         rwnn_p = self.rwnn.weights.numel()
         return {
             "token_embedding": tok,
-            "pos_embedding": pos,
+            "pos_embedding": pos,    # 0 for sinusoidal (non-learnable buffer)
             "rwnn": rwnn_p,
             "total": tok + pos + rwnn_p,
         }
+
+
+def _build_sinusoidal_table(T: int, d: int) -> torch.Tensor:
+    """Vaswani-2017 closed-form positional encoding.
+
+    PE(t, 2i)   = sin(t / 10000^(2i/d))
+    PE(t, 2i+1) = cos(t / 10000^(2i/d))
+
+    Different dimensions oscillate at log-spaced frequencies — fast at
+    low indices, slow at high indices. The dot product
+    PE(t) · PE(t+k) depends only on k, which gives the model an
+    implicit relative-position structure even though the encoding
+    itself is absolute. Returns a [T, d] float tensor.
+    """
+    pos = torch.arange(T).unsqueeze(1).float()             # [T, 1]
+    half_d = d // 2
+    i = torch.arange(half_d).float()                       # [d/2]
+    div = torch.exp(-math.log(10000.0) * 2.0 * i / d)      # [d/2]
+    pe = torch.zeros(T, d)
+    pe[:, 0::2] = torch.sin(pos * div)                     # even dims
+    pe[:, 1::2] = torch.cos(pos * div)[:, : d - half_d]    # odd dims
+    return pe

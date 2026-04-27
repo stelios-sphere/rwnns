@@ -22,13 +22,22 @@ every vocab entry is its own output node. **No `in_proj` / `out_proj`
 linear layers** — the embedding feeds the random graph directly, and
 the random graph's outputs are the logits.
 
-A learnable per-position embedding is added to the token embedding
-before flattening, so each (position, dim) input node carries a unique
+A per-position embedding is added to the token embedding before
+flattening, so each (position, dim) input node carries a unique
 positional signature in addition to its token's content. Without this,
 two identical tokens at different positions produced identical
 embeddings, and the only positional signal the RWNN had was *which*
 input nodes a value lands at — easy to wash out under random
 connectivity.
+
+Two positional encodings are supported via ``cfg.pos_encoding``:
+
+- ``"learned"`` — `nn.Embedding(T, d_model)`, gradient-trained, 6,144
+  extra params at our default config.
+- ``"sinusoidal"`` (default in this run) — Vaswani-2017 closed form:
+  even dims = `sin(t / 10000^(2i/d))`, odd dims = `cos(...)` at
+  log-spaced frequencies. Parameter-free, extrapolates to any context
+  length. Stored as a non-learnable buffer.
 
 Default config (`run.py`):
 

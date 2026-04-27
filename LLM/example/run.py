@@ -74,7 +74,10 @@ POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal"
 PARALLEL = True             # two parallel mirror RWNNs: one all-linear, one
                             # all-bilinear, summed at the output (logits = L + B)
 
-BATCH_SIZE = 64
+BATCH_SIZE = 256   # was 64. Bigger batches cut gradient noise ~2x; the
+                   # post-best loss climb across all prior runs looked like
+                   # the optimizer wandering once useful descent directions
+                   # got drowned in noise.
 # LR sized for 66M params. The earlier 3e-3 diverged past step ~2000
 # (above random baseline) because peak was too aggressive for this scale.
 # Standard transformer practice at ~60M is 3e-4 – 1e-3; we go 5e-4 and

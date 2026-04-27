@@ -88,7 +88,9 @@ EVAL_ITERS = 40
 SEED = 0
 
 # Mid-training peeks: every N training steps, generate a short sample.
-SAMPLE_EVERY_N_STEPS = 100
+# At ctx=1024 each sample is ~9 s of forward passes, so we keep this
+# infrequent enough not to dominate wall time.
+SAMPLE_EVERY_N_STEPS = 1000
 SAMPLE_DURING_TRAIN_PROMPT = "Once upon a time"
 SAMPLE_DURING_TRAIN_TOKENS = 60
 SAMPLE_DURING_TRAIN_TEMP = 0.85

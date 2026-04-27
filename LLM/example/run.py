@@ -65,7 +65,10 @@ D_MODEL = 48
 # at ~66 ms/step for ctx=1024.
 N_NODES = 80000
 N_LAYERS = 8
-EDGE_PROB = 0.030
+EDGE_PROB = 0.005    # was 0.030 — lower density so each hidden node samples
+                     # ~250 parents instead of ~1,475, leaving room for
+                     # positional/feature specialisation rather than uniform
+                     # averaging across all input nodes
 BILINEAR_FRACTION = 0.05    # ignored when PARALLEL is True (see llm.py)
 POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal"
 PARALLEL = True             # two parallel mirror RWNNs: one all-linear, one

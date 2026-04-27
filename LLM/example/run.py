@@ -51,7 +51,7 @@ DATA_VAL = "WikiText-103-valid.txt"
 BPE_TRAIN_BYTES = 80 * 1024 * 1024   # train BPE on first 80 MB only (speed)
 
 VOCAB_SIZE = 1024
-CONTEXT_LENGTH = 1024              # ↑ from 128 — edit this single value to change context
+CONTEXT_LENGTH = 512               # half of 1024; n_in = 512*48 = 24,576 input nodes
 D_MODEL = 48
 # RWNN n_in = CONTEXT_LENGTH * D_MODEL = 49,152 input nodes (every (pos, dim))
 # RWNN n_out = VOCAB_SIZE = 1024                 (every vocab entry is an output)
@@ -65,10 +65,10 @@ D_MODEL = 48
 # at ~66 ms/step for ctx=1024.
 N_NODES = 80000
 N_LAYERS = 8
-EDGE_PROB = 0.005    # was 0.030 — lower density so each hidden node samples
-                     # ~250 parents instead of ~1,475, leaving room for
-                     # positional/feature specialisation rather than uniform
-                     # averaging across all input nodes
+EDGE_PROB = 0.020    # at ctx=512 (n_in=24,576), this gives ~492 parents per
+                     # first-hidden node — enough connectivity for real
+                     # information to flow without the 1,475-parent uniform-
+                     # mixture problem we hit at ctx=1024 + 0.030.
 BILINEAR_FRACTION = 0.05    # ignored when PARALLEL is True (see llm.py)
 POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal"
 PARALLEL = True             # two parallel mirror RWNNs: one all-linear, one

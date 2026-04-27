@@ -218,3 +218,35 @@ If we run all three at the same dataset (TinyStories) and same
       both runs' artefacts coexist.
 
 That's the full plan. Pick this up after the current run gives a number.
+
+---
+
+## Constraint: keep this a *pure* RWNN
+
+This whole research line is about what a randomly-wired graph **on its
+own** can express, with no transformer scaffolding. Every extension
+explored under "next_research" must therefore stay inside the RWNN
+abstraction:
+
+- **No residual connections** between sub-graphs. The graph IS the
+  computation.
+- **No layer / RMS normalisation.** If gradient stability requires
+  norms, the right answer is to fix the graph topology or activation
+  rather than bolt on a normaliser.
+- **No "RWNN as FFN inside a transformer block".** That line of
+  research exists in the literature already (sparse-MoE FFNs, etc.);
+  it's not what this repo is investigating.
+
+Acceptable extensions:
+- New node *kinds* (linear, bilinear, trilinear, gated, …) co-existing
+  in one DAG.
+- Connectivity rules (position-local, hierarchical edge probability,
+  evolved topologies).
+- Whole-network primitives (parallel mirrors, multiple co-trained
+  graphs sharing input/output).
+- Different builders (skip-connection-rich, fully sparse, etc.) that
+  produce a pure DAG.
+
+The boundary is: *if it isn't expressible as a single random feed-forward
+DAG (possibly with multiple kinds of nodes and possibly multiple co-trained
+graphs sharing only inputs/outputs), it's out of scope here.*

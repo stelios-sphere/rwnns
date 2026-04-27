@@ -79,7 +79,10 @@ BATCH_SIZE = 64
 # (above random baseline) because peak was too aggressive for this scale.
 # Standard transformer practice at ~60M is 3e-4 – 1e-3; we go 5e-4 and
 # warm up longer to stay safe.
-PEAK_LR = 2e-4
+PEAK_LR = 1e-4   # was 2e-4. Halved because the edge_prob=0.005 + WikiText
+                 # combo diverged at 2e-4 — at 19 M params each edge sees
+                 # less averaging, so per-edge gradients are larger and the
+                 # LR has to drop accordingly.
 MIN_LR = 1e-5
 WARMUP_STEPS = 4000
 COSINE_DECAY_STEPS = 2_000_000
@@ -94,13 +97,14 @@ SEED = 0
 # At ctx=1024 each sample is ~9 s of forward passes, so we keep this
 # infrequent enough not to dominate wall time.
 SAMPLE_EVERY_N_STEPS = 1000
-SAMPLE_DURING_TRAIN_PROMPT = "Once upon a time"
+# Wikipedia-shaped seed (matches WikiText-103's article structure).
+SAMPLE_DURING_TRAIN_PROMPT = "The "
 SAMPLE_DURING_TRAIN_TOKENS = 60
 SAMPLE_DURING_TRAIN_TEMP = 0.85
 SAMPLE_DURING_TRAIN_TOPK = 50
 
-# Final sample at end of run.
-SAMPLE_PROMPT = "Once upon a time, there was a little girl"
+# Final sample at end of run — also WikiText-shaped.
+SAMPLE_PROMPT = " = History = \n The "
 SAMPLE_TOKENS = 300
 SAMPLE_TEMPERATURE = 0.8
 SAMPLE_TOP_K = 40

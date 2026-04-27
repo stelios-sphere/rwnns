@@ -53,8 +53,10 @@ BPE_TRAIN_BYTES = 80 * 1024 * 1024   # train BPE on first 80 MB only (speed)
 VOCAB_SIZE = 1024
 CONTEXT_LENGTH = 128
 D_MODEL = 48
-N_IN_RWNN = 384
-N_OUT_RWNN = 384
+# RWNN n_in = CONTEXT_LENGTH * D_MODEL = 6144  (every (pos, dim) is an input node)
+# RWNN n_out = VOCAB_SIZE = 1024              (every vocab entry is an output node)
+# No projection layers — the embedding flows straight into the RWNN, the
+# RWNN's outputs are the logits.
 N_NODES = 45000
 N_LAYERS = 8
 EDGE_PROB = 0.075
@@ -76,7 +78,15 @@ EVAL_INTERVAL_SECONDS = 60.0
 EVAL_ITERS = 40
 SEED = 0
 
-SAMPLE_PROMPT = "We are accounted poor citizens, the patricians good."
+# Mid-training peeks: every N training steps, generate a short sample.
+SAMPLE_EVERY_N_STEPS = 100
+SAMPLE_DURING_TRAIN_PROMPT = "Once upon a time"
+SAMPLE_DURING_TRAIN_TOKENS = 60
+SAMPLE_DURING_TRAIN_TEMP = 0.85
+SAMPLE_DURING_TRAIN_TOPK = 50
+
+# Final sample at end of run.
+SAMPLE_PROMPT = "Once upon a time, there was a little girl"
 SAMPLE_TOKENS = 300
 SAMPLE_TEMPERATURE = 0.8
 SAMPLE_TOP_K = 40
@@ -232,8 +242,6 @@ def main():
         vocab_size=tok.vocab_size,
         context_length=CONTEXT_LENGTH,
         d_model=D_MODEL,
-        n_in_rwnn=N_IN_RWNN,
-        n_out_rwnn=N_OUT_RWNN,
         n_nodes=N_NODES,
         n_layers=N_LAYERS,
         edge_prob=EDGE_PROB,
@@ -244,10 +252,12 @@ def main():
         cfg, device, latest_path, best_path
     )
     counts = model.num_parameters()
-    print(f"model: total={counts['total']:,}  rwnn={counts['rwnn']:,} "
-          f"({counts['rwnn']/counts['total']*100:.0f}%)  "
-          f"in={counts['in_projection']:,}  out={counts['out_projection']:,}")
-    print(f"rwnn graph: {model.rwnn.n_nodes} nodes, {model.rwnn.n_edges:,} edges, "
+    print(f"model: total={counts['total']:,}  "
+          f"emb={counts['embedding']:,}  rwnn={counts['rwnn']:,} "
+          f"({counts['rwnn']/counts['total']*100:.0f}%)")
+    print(f"rwnn graph: n_in={model.rwnn.n_in} (= ctx*d_model), "
+          f"n_out={model.rwnn.n_out} (= vocab), "
+          f"{model.rwnn.n_nodes} nodes, {model.rwnn.n_edges:,} edges, "
           f"{model.rwnn.n_levels} levels")
 
     # --- one-time architecture metadata dump ---
@@ -320,6 +330,22 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             opt.step()
             step += 1
+
+            # Mid-training peek: short sample every SAMPLE_EVERY_N_STEPS.
+            if step % SAMPLE_EVERY_N_STEPS == 0:
+                with torch.no_grad():
+                    prompt_ids = tok.encode_to_tensor(
+                        SAMPLE_DURING_TRAIN_PROMPT, device=device,
+                    )
+                    out = model.generate(
+                        prompt_ids,
+                        max_new_tokens=SAMPLE_DURING_TRAIN_TOKENS,
+                        temperature=SAMPLE_DURING_TRAIN_TEMP,
+                        top_k=SAMPLE_DURING_TRAIN_TOPK,
+                    )
+                    sample = tok.decode(out[0]).replace("\n", " | ")
+                print(f"  [step {step:6d}] sample: {sample[:200]}",
+                      flush=True)
 
             now = time.time()
             if now - t_last_eval >= EVAL_INTERVAL_SECONDS:

@@ -1,26 +1,26 @@
 """RWNN-LLM: a small autoregressive language model with an RWNN core.
 
-Architecture (one forward pass predicts ONE next token):
+Architecture — *no projection layers*. Every (token-position,
+embedding-dimension) pair is its own RWNN input node, every vocab entry
+is its own RWNN output node:
 
     ids  [B, T]                             T token ids, the context
       │  token embedding  (V, d_model)
       ▼
     emb  [B, T, d_model]
-      │  flatten + in_proj  Linear(T·d_model -> n_in)
+      │  flatten
       ▼
-    rwnn_in  [B, n_in]
+    flat [B, T·d_model]                     RWNN input (n_in = T·d_model)
       │  RWNN  (tanh hidden, linear output)
       ▼
-    rwnn_out [B, n_out]
-      │  out_proj  Linear(n_out -> V)
-      ▼
-    logits   [B, V]        logits for the next token
+    logits [B, V]                           RWNN output (n_out = V)
 
-The three knobs ``context_length``, ``n_nodes``, ``n_layers`` (plus
-``edge_prob`` for density) drive the RWNN topology: they are forwarded
-straight to ``build_layered_rwnn`` along with ``n_in_rwnn`` and
-``n_out_rwnn`` so the RWNN's inputs and outputs match the interface
-layers around it.
+The configurable knobs ``context_length``, ``n_nodes``, ``n_layers`` and
+``edge_prob`` drive the RWNN topology directly. ``n_in`` and ``n_out``
+are *derived*: ``n_in = context_length * d_model``,
+``n_out = vocab_size``. There is no in-projection or out-projection
+linear layer — those would compress / expand tokens through a
+fixed-width bottleneck before the random graph could reason over them.
 
 For training, sample random fixed-length contexts out of a pre-tokenised
 GPU tensor and minimise cross-entropy of the next token. For generation,
@@ -43,9 +43,7 @@ class RWNNLMConfig:
     vocab_size: int
     context_length: int = 64        # T — number of tokens the model looks at
     d_model: int = 32               # token embedding dimension
-    n_in_rwnn: int = 128            # RWNN input width
-    n_out_rwnn: int = 128           # RWNN output width
-    n_nodes: int = 1500             # total RWNN nodes (incl. in + bias + hidden + out)
+    n_nodes: int = 1500             # total RWNN nodes (in + bias + hidden + out)
     n_layers: int = 5               # RWNN topological depth
     edge_prob: float = 0.03         # RWNN connection density
     bilinear_fraction: float = 0.0  # fraction of compute nodes that are bilinear gates
@@ -59,23 +57,32 @@ class RWNNLM(nn.Module):
         self.cfg = cfg
         self.device = torch.device(device)
 
-        # Build the RWNN core first so we can report its edge count.
+        # Derived RWNN dimensions: every embedded feature is an input node,
+        # every vocab entry is an output node. No bottleneck.
+        n_in = cfg.context_length * cfg.d_model
+        n_out = cfg.vocab_size
+        n_role = n_in + cfg.n_bias + n_out
+        if cfg.n_nodes < n_role + 1:
+            raise ValueError(
+                f"n_nodes={cfg.n_nodes} too small: need at least "
+                f"{n_role + 1} (n_in={n_in} + n_bias={cfg.n_bias} + "
+                f"n_out={n_out} + 1 hidden)"
+            )
+
         graph = build_layered_rwnn(
             n_nodes=cfg.n_nodes,
             edge_prob=cfg.edge_prob,
             n_layers=cfg.n_layers,
-            n_in=cfg.n_in_rwnn,
+            n_in=n_in,
             n_bias=cfg.n_bias,
-            n_out=cfg.n_out_rwnn,
+            n_out=n_out,
             seed=cfg.seed,
             bilinear_fraction=cfg.bilinear_fraction,
         )
         self.rwnn = RWNN(graph, device=self.device)
 
-        # Interface layers.
+        # Token embedding only — no projection layers.
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.in_proj = nn.Linear(cfg.context_length * cfg.d_model, cfg.n_in_rwnn)
-        self.out_proj = nn.Linear(cfg.n_out_rwnn, cfg.vocab_size)
 
         self.to(self.device)
 
@@ -90,11 +97,9 @@ class RWNNLM(nn.Module):
         assert T == self.cfg.context_length, (
             f"context_length mismatch: model={self.cfg.context_length}, got T={T}"
         )
-        emb = self.token_emb(ids)            # [B, T, d_model]
-        flat = emb.reshape(B, T * self.cfg.d_model)
-        x = self.in_proj(flat)               # [B, n_in]
-        x = self.rwnn(x)                     # [B, n_out]
-        logits = self.out_proj(x)            # [B, V]
+        emb = self.token_emb(ids)                    # [B, T, d_model]
+        flat = emb.reshape(B, T * self.cfg.d_model)  # [B, n_in]
+        logits = self.rwnn(flat)                     # [B, V]
         return logits
 
     # ------------------------------------------------------------------
@@ -149,13 +154,9 @@ class RWNNLM(nn.Module):
 
     def num_parameters(self) -> dict[str, int]:
         emb = self.token_emb.weight.numel()
-        in_p = self.in_proj.weight.numel() + self.in_proj.bias.numel()
         rwnn_p = self.rwnn.weights.numel()
-        out_p = self.out_proj.weight.numel() + self.out_proj.bias.numel()
         return {
             "embedding": emb,
-            "in_projection": in_p,
             "rwnn": rwnn_p,
-            "out_projection": out_p,
-            "total": emb + in_p + rwnn_p + out_p,
+            "total": emb + rwnn_p,
         }

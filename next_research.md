@@ -250,3 +250,130 @@ Acceptable extensions:
 The boundary is: *if it isn't expressible as a single random feed-forward
 DAG (possibly with multiple kinds of nodes and possibly multiple co-trained
 graphs sharing only inputs/outputs), it's out of scope here.*
+
+---
+
+## RWNN attention — next thing to try if the current run fails
+
+Bilinear gating nodes (current) are **not** attention. They cover
+GLU/SwiGLU territory: gated multiplicative interactions per node. They
+do not compute **content-based similarity between two activations**, do
+not normalise via softmax, and do not perform **soft routing across
+positions**. Attention is the missing primitive for sustained
+syntactic dependency in language modelling, and the post-step-5000 val
+plateau we're hitting at every ctx≥512 configuration likely reflects
+its absence.
+
+### Two new pure-RWNN node kinds
+
+This proposal adds attention as a primitive *without* introducing any
+transformer scaffolding (no residuals, no normalisation outside the
+node, no separate sub-blocks). Just two node kinds in the same DAG:
+
+1. **Product node**: ``a_i = a_g · a_v`` (or ``Σ a_g · a_v`` over
+   paired parents). **No weights** — pure activation product. Used
+   for similarity / Q·K-style scoring. Symmetric in its two parents.
+2. **Softmax-aggregator node**: takes K pairs of ``(score, value)``
+   parents, computes ``weights = softmax(scores)``, returns
+   ``Σ_k weights[k] · values[k]``. The normalisation lives *inside*
+   the node — no external norm needed. Output is the soft-weighted
+   sum of values.
+
+### What an "attention head" looks like inside the random DAG
+
+A single attention-head subgraph becomes:
+
+- **N product nodes**, each computing a Q·K-style similarity between
+  two specific projection-pair parents (where the projections are
+  themselves earlier-layer linear nodes acting as Q and K).
+- **N corresponding linear nodes** computing V-style values for those
+  same N positions.
+- **1 softmax-aggregator node** that consumes the N (score, value)
+  pairs and emits one attended output.
+
+The "Q-projection" and "K-projection" are just learned linear nodes
+applied to the input; the model figures out per-head what to compare.
+With a few hundred such heads scattered through the DAG (each head's
+N varies — small for local heads, large for global), the network has
+real attention machinery built from RWNN primitives.
+
+### Why this is pure-RWNN compatible
+
+- All four node kinds (linear, bilinear, product, softmax-aggregator)
+  live in **one DAG**. No sub-blocks, no residuals between them.
+- **No external normalisation** — softmax is internal to the
+  aggregator node, the same way `tanh` is internal to a linear node
+  today.
+- The **graph is still the computation**. Connectivity rules
+  (random, position-local, evolved) work the same as before; only
+  the per-node operator set has grown.
+
+### Topology strategies
+
+Two options for getting attention-shaped subgraphs into the random DAG:
+
+A. **Pure random**. Just allow the four node kinds to be sampled in
+   any proportion. The RWNN may or may not develop attention-shaped
+   subgraphs spontaneously. Cheap to try; might not work without
+   structural prior.
+B. **Seeded attention heads**. Pre-place a small number of
+   hand-designed attention subgraphs in the DAG (e.g. 8 heads, each
+   with N=64 product+linear+softmax nodes wired correctly), then
+   randomly wire the rest of the graph around them. The hand-design
+   gives the model attention as a primitive; the surrounding random
+   wiring lets it find non-attention computation paths too.
+C. **Evolutionary search** (Part 3 style). Multi-objective NAS over
+   (val loss, total edges, fraction-attention-shaped). Let evolution
+   discover the right mix.
+
+I'd start with B (seeded) — it's the most direct test of whether
+attention is the missing primitive. If seeded heads improve val
+substantially over the current bilinear-only ceiling, that's the
+hypothesis confirmed; A and C are then worth pursuing.
+
+### Implementation cost
+
+Two new node kinds means:
+- Two more branches in ``forward_level_kernel``.
+- Two more branches in ``backward_propagate_kernel`` and
+  ``backward_weight_kernel``.
+- Softmax requires a small intra-node reduction across paired
+  parents. Doable in Triton with `tl.softmax` over a fixed-size
+  vector, or manually with `max + exp + sum`.
+- Backward through softmax: standard
+  `softmax(s)_k · (1 - softmax(s)_k)` for the diagonal,
+  `-softmax(s)_j · softmax(s)_k` off-diagonal. ~30 lines of Triton.
+
+Estimated effort: ~half a day to add the kernels and wire them through
+``RandomDAG`` / ``RWNN`` / ``llm.py``. Add a flag like
+``cfg.attention_heads = 8`` for the seeded variant.
+
+### Implementation checklist
+
+- [ ] Extend ``node_kinds`` to support {0=linear, 1=bilinear,
+      2=product, 3=softmax_aggregator}.
+- [ ] Add product-node forward/backward kernel branches.
+- [ ] Add softmax-aggregator node forward (reduction across pairs)
+      and backward (Jacobian of softmax).
+- [ ] Builder: add a "seed_attention_heads" option to
+      ``build_layered_rwnn`` that pre-places K attention subgraphs
+      with the right wiring.
+- [ ] Verify gradients vs. a pure-PyTorch reference at small scale
+      (just like the existing tests for linear and bilinear).
+- [ ] Train the seeded-attention variant on WikiText-103 with
+      otherwise-identical config to the current parallel-mirrors run.
+- [ ] If val drops substantially below ~4.5: the hypothesis is
+      confirmed and we expand attention coverage.
+
+### Empirical predictions
+
+- **Val loss** should drop into the ~3.0-3.5 zone — comparable to
+  small transformers — *if* attention is what the model was missing.
+  If val stays around ~4.5, the bottleneck is somewhere else (maybe
+  simply more data needed, or a deeper structural problem).
+- **Sample quality**: should produce locally coherent multi-token
+  spans, with proper coreference (`The X ... it ...`) and
+  consistent named entities across a paragraph — neither of which
+  the current bilinear-only model can sustain.
+- **Training speed**: expect ~30-50 % slower per step than current,
+  largely from the softmax-aggregator's per-node reduction work.

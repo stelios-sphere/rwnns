@@ -51,15 +51,21 @@ DATA_VAL = "TinyStories-valid.txt"
 BPE_TRAIN_BYTES = 80 * 1024 * 1024   # train BPE on first 80 MB only (speed)
 
 VOCAB_SIZE = 1024
-CONTEXT_LENGTH = 128
+CONTEXT_LENGTH = 1024              # ↑ from 128 — edit this single value to change context
 D_MODEL = 48
-# RWNN n_in = CONTEXT_LENGTH * D_MODEL = 6144  (every (pos, dim) is an input node)
-# RWNN n_out = VOCAB_SIZE = 1024              (every vocab entry is an output node)
-# No projection layers — the embedding flows straight into the RWNN, the
-# RWNN's outputs are the logits.
-N_NODES = 45000
+# RWNN n_in = CONTEXT_LENGTH * D_MODEL = 49,152 input nodes (every (pos, dim))
+# RWNN n_out = VOCAB_SIZE = 1024                 (every vocab entry is an output)
+# No projection layers — embedding flows straight into the RWNN, the RWNN's
+# outputs are the logits. Context length is therefore baked into the graph
+# topology; changing it requires rebuilding the graph and retraining.
+#
+# When CONTEXT_LENGTH grows, n_in grows linearly. n_nodes must stay above
+# n_in + n_bias + n_out + 1, and edge_prob has to drop to keep edge count
+# (~ n_nodes^2 * edge_prob) bounded. The defaults below target ~58 M params
+# at ~66 ms/step for ctx=1024.
+N_NODES = 80000
 N_LAYERS = 8
-EDGE_PROB = 0.075
+EDGE_PROB = 0.030
 BILINEAR_FRACTION = 0.05    # ~5% of compute nodes are bilinear gates
 POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal" — see llm.py
 

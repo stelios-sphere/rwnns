@@ -9,12 +9,18 @@ Triton's LLVM pipeline, same machine code class as hand-written CUDA):
 4. ``backward_weight_kernel``     — per-edge weight gradient (batch reduction).
 
 Node kinds (per-destination dispatch inside each kernel):
-    KIND_LINEAR   = 0:  pre = Σ_k  w_k · a_{p_k}
-    KIND_BILINEAR = 1:  pre = Σ_pairs  σ(w_g · a_g) · w_v · a_v
-                       (parents iterated as paired (gate, value); each
-                       pair contributes one gated value to the sum;
-                       the same tanh is applied at the output as for
-                       linear nodes for numerical stability.)
+    KIND_LINEAR      = 0:  pre = Σ_k  w_k · a_{p_k}
+    KIND_BILINEAR    = 1:  pre = Σ_pairs  σ(w_g · a_g) · w_v · a_v
+                          (parents iterated as paired (gate, value);
+                           each pair contributes one gated value;
+                           tanh applied at the output for stability.)
+    KIND_PRODUCT     = 2:  pre = Σ_pairs  a_g · a_v
+                          (parents in pairs; pure activation product,
+                           no weights. Symmetric in its two parents.)
+    KIND_SOFTMAX_AGG = 3:  pre = Σ_k  softmax(scores)_k · value_k
+                          (parents in (score, value) pairs; softmax
+                           taken across the K pairs; no weights;
+                           internal max-subtract for stability.)
 
 Activation codes (the *output* nonlinearity, applied after the
 node-kind-specific accumulation):
@@ -66,7 +72,7 @@ def forward_level_kernel(
             w = tl.load(weights_ptr + k)
             a_j = tl.load(a_ptr + j * B + offs_b, mask=mask_b, other=0.0)
             acc += w * a_j
-    else:
+    elif kind == 1:
         # BILINEAR: parents in (gate, value) pairs, step by 2.
         for k in range(start, end, 2):
             jg = tl.load(parent_ids_ptr + k).to(tl.int64)
@@ -78,6 +84,37 @@ def forward_level_kernel(
             zg = wg * a_g
             g = 1.0 / (1.0 + tl.exp(-zg))   # sigmoid
             acc += g * (wv * a_v)
+    elif kind == 2:
+        # PRODUCT: pairs (g, v), no weights — pure activation product.
+        for k in range(start, end, 2):
+            jg = tl.load(parent_ids_ptr + k).to(tl.int64)
+            jv = tl.load(parent_ids_ptr + k + 1).to(tl.int64)
+            a_g = tl.load(a_ptr + jg * B + offs_b, mask=mask_b, other=0.0)
+            a_v = tl.load(a_ptr + jv * B + offs_b, mask=mask_b, other=0.0)
+            acc += a_g * a_v
+    else:
+        # SOFTMAX_AGG (kind == 3): pairs (score, value).
+        # 3-pass softmax with max-subtract for numerical stability:
+        #   pass 1: m   = max_k(score_k)
+        #   pass 2: Z   = Σ_k exp(score_k - m)
+        #   pass 3: pre = Σ_k (exp(score_k - m) / Z) · value_k
+        m = tl.full([BLOCK_B], -1.0e30, dtype=tl.float32)
+        for k in range(start, end, 2):
+            js = tl.load(parent_ids_ptr + k).to(tl.int64)
+            a_s = tl.load(a_ptr + js * B + offs_b, mask=mask_b, other=-1.0e30)
+            m = tl.maximum(m, a_s)
+        Z = tl.zeros([BLOCK_B], dtype=tl.float32)
+        for k in range(start, end, 2):
+            js = tl.load(parent_ids_ptr + k).to(tl.int64)
+            a_s = tl.load(a_ptr + js * B + offs_b, mask=mask_b, other=-1.0e30)
+            Z += tl.exp(a_s - m)
+        for k in range(start, end, 2):
+            js = tl.load(parent_ids_ptr + k).to(tl.int64)
+            jv = tl.load(parent_ids_ptr + k + 1).to(tl.int64)
+            a_s = tl.load(a_ptr + js * B + offs_b, mask=mask_b, other=-1.0e30)
+            a_v = tl.load(a_ptr + jv * B + offs_b, mask=mask_b, other=0.0)
+            w = tl.exp(a_s - m) / Z
+            acc += w * a_v
 
     row = i * B + offs_b
     tl.store(pre_ptr + row, acc, mask=mask_b)
@@ -132,7 +169,8 @@ def backward_dpre_kernel(
 @triton.jit
 def backward_propagate_kernel(
     d_a_ptr,                # float32 [N, B] — atomically incremented at parent rows
-    a_ptr,                  # float32 [N, B] — needed to recompute g, v for bilinear
+    a_ptr,                  # float32 [N, B] — needed to recompute g, v, scores
+    pre_ptr,                # float32 [N, B] — needed for softmax-agg backward
     d_pre_ptr,              # float32 [N, B]
     weights_ptr,            # float32 [E]
     level_nodes_ptr,        # int32 [n_level]
@@ -161,7 +199,7 @@ def backward_propagate_kernel(
             j = tl.load(parent_ids_ptr + k).to(tl.int64)
             w = tl.load(weights_ptr + k)
             tl.atomic_add(d_a_ptr + j * B + offs_b, w * d_pre_i, mask=mask_b)
-    else:
+    elif kind == 1:
         # BILINEAR: each (gate, value) pair contributes
         #   d/d a_g  =  w_g · σ'(z_g) · v ,    v = w_v · a_v
         #   d/d a_v  =  σ(z_g) · w_v
@@ -180,6 +218,42 @@ def backward_propagate_kernel(
             d_a_g = wg * sig_deriv * v * d_pre_i
             d_a_v = g * wv * d_pre_i
             tl.atomic_add(d_a_ptr + jg * B + offs_b, d_a_g, mask=mask_b)
+            tl.atomic_add(d_a_ptr + jv * B + offs_b, d_a_v, mask=mask_b)
+    elif kind == 2:
+        # PRODUCT: ∂(a_g · a_v)/∂a_g = a_v, ∂/∂a_v = a_g.
+        for k in range(start, end, 2):
+            jg = tl.load(parent_ids_ptr + k).to(tl.int64)
+            jv = tl.load(parent_ids_ptr + k + 1).to(tl.int64)
+            a_g = tl.load(a_ptr + jg * B + offs_b, mask=mask_b, other=0.0)
+            a_v = tl.load(a_ptr + jv * B + offs_b, mask=mask_b, other=0.0)
+            tl.atomic_add(d_a_ptr + jg * B + offs_b, a_v * d_pre_i, mask=mask_b)
+            tl.atomic_add(d_a_ptr + jv * B + offs_b, a_g * d_pre_i, mask=mask_b)
+    else:
+        # SOFTMAX_AGG (kind == 3): pairs (score, value).
+        #   pre  = Σ_k w_k · v_k,  w_k = exp(s_k - m) / Z
+        #   ∂pre/∂v_k = w_k
+        #   ∂pre/∂s_k = w_k · (v_k - pre)
+        # Recompute m, Z (3-pass softmax) and read pre from saved buffer.
+        pre_i = tl.load(pre_ptr + i * B + offs_b, mask=mask_b, other=0.0)
+        m = tl.full([BLOCK_B], -1.0e30, dtype=tl.float32)
+        for k in range(start, end, 2):
+            js = tl.load(parent_ids_ptr + k).to(tl.int64)
+            a_s = tl.load(a_ptr + js * B + offs_b, mask=mask_b, other=-1.0e30)
+            m = tl.maximum(m, a_s)
+        Z = tl.zeros([BLOCK_B], dtype=tl.float32)
+        for k in range(start, end, 2):
+            js = tl.load(parent_ids_ptr + k).to(tl.int64)
+            a_s = tl.load(a_ptr + js * B + offs_b, mask=mask_b, other=-1.0e30)
+            Z += tl.exp(a_s - m)
+        for k in range(start, end, 2):
+            js = tl.load(parent_ids_ptr + k).to(tl.int64)
+            jv = tl.load(parent_ids_ptr + k + 1).to(tl.int64)
+            a_s = tl.load(a_ptr + js * B + offs_b, mask=mask_b, other=-1.0e30)
+            a_v = tl.load(a_ptr + jv * B + offs_b, mask=mask_b, other=0.0)
+            w = tl.exp(a_s - m) / Z
+            d_a_v = w * d_pre_i
+            d_a_s = w * (a_v - pre_i) * d_pre_i
+            tl.atomic_add(d_a_ptr + js * B + offs_b, d_a_s, mask=mask_b)
             tl.atomic_add(d_a_ptr + jv * B + offs_b, d_a_v, mask=mask_b)
 
 
@@ -220,6 +294,10 @@ def backward_weight_kernel(
             off += BLOCK_B
         total = tl.sum(acc, axis=0)
         tl.store(d_w_ptr + e, total)
+    elif kind >= 2:
+        # PRODUCT (2) and SOFTMAX_AGG (3) have no learnable weights — the
+        # weight tensor entries for these edges are unused. d_w[e] = 0.
+        tl.store(d_w_ptr + e, 0.0)
     else:
         # BILINEAR: depends on whether this edge is the gate (even pos in
         # parent list) or the value (odd pos). Partner edge gives us the

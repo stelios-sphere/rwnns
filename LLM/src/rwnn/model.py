@@ -136,7 +136,7 @@ class RWNNFunction(torch.autograd.Function):
                 B, BLOCK_B=_BLOCK_B, ACT=act,
             )
             backward_propagate_kernel[grid](
-                d_a, a, d_pre, weights, level_slice,
+                d_a, a, pre, d_pre, weights, level_slice,
                 parent_offsets, parent_ids, node_kinds,
                 B, BLOCK_B=_BLOCK_B,
             )

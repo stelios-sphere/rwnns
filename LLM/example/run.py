@@ -69,10 +69,14 @@ EDGE_PROB = 0.020    # at ctx=512 (n_in=24,576), this gives ~492 parents per
                      # first-hidden node — enough connectivity for real
                      # information to flow without the 1,475-parent uniform-
                      # mixture problem we hit at ctx=1024 + 0.030.
-BILINEAR_FRACTION = 0.05    # ignored when PARALLEL is True (see llm.py)
+BILINEAR_FRACTION = 0.10    # σ(w_g·a_g) · w_v·a_v — multiplicative gating
+PRODUCT_FRACTION = 0.0      # a_g · a_v — pure activation product, no weights
+ATTENTION_FRACTION = 0.10   # softmax(score_k) · value_k — attention-as-node-kind
+                            # (parents in (score, value) pairs, no weights)
 POS_ENCODING = "sinusoidal" # "learned" | "sinusoidal"
-PARALLEL = True             # two parallel mirror RWNNs: one all-linear, one
-                            # all-bilinear, summed at the output (logits = L + B)
+PARALLEL = False            # mixed-kinds experiment uses a single graph; parallel
+                            # mode hardcodes the two branches to all-linear and
+                            # all-bilinear and ignores the fractions above.
 
 BATCH_SIZE = 256   # was 64. Bigger batches cut gradient noise ~2x; the
                    # post-best loss climb across all prior runs looked like
@@ -267,6 +271,8 @@ def main():
         n_layers=N_LAYERS,
         edge_prob=EDGE_PROB,
         bilinear_fraction=BILINEAR_FRACTION,
+        product_fraction=PRODUCT_FRACTION,
+        attention_fraction=ATTENTION_FRACTION,
         pos_encoding=POS_ENCODING,
         parallel=PARALLEL,
         seed=SEED,

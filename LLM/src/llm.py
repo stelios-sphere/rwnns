@@ -48,6 +48,8 @@ class RWNNLMConfig:
     n_layers: int = 5               # RWNN topological depth
     edge_prob: float = 0.03         # RWNN connection density
     bilinear_fraction: float = 0.0  # fraction of compute nodes that are bilinear gates
+    product_fraction: float = 0.0   # fraction of compute nodes that are pure-product
+    attention_fraction: float = 0.0 # fraction of compute nodes that are softmax-aggregator
     n_bias: int = 2                 # bias nodes inside RWNN
     seed: int = 0
     # Positional encoding scheme. "learned" = nn.Embedding(T, d_model), trained
@@ -109,6 +111,8 @@ class RWNNLM(nn.Module):
                 edge_prob=cfg.edge_prob,
                 n_layers=cfg.n_layers,
                 n_in=n_in,
+                product_fraction=cfg.product_fraction,
+                attention_fraction=cfg.attention_fraction,
                 n_bias=cfg.n_bias,
                 n_out=n_out,
                 seed=cfg.seed,

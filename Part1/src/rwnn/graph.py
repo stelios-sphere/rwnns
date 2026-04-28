@@ -239,6 +239,8 @@ def build_layered_rwnn(
     n_out: int = 1,
     seed: int | None = None,
     bilinear_fraction: float = 0.0,
+    product_fraction: float = 0.0,
+    attention_fraction: float = 0.0,
 ) -> RandomDAG:
     """Random DAG with a user-specified number of topological levels.
 
@@ -277,16 +279,37 @@ def build_layered_rwnn(
     ``n_layers`` and in which every node participates in at least one
     input-to-output path.
 
-    Bilinear gating nodes
-    ---------------------
-    If ``bilinear_fraction > 0``, that fraction of compute nodes
-    (hidden + output) are randomly designated as **bilinear gating
-    nodes**. They have an even number of parents paired in CSR order
-    as (gate, value); each pair contributes
-    ``σ(w_g · a_gate) · w_v · a_value`` to the node's pre-activation,
-    which is then ``tanh``'d like a linear node. After pair adjustment
-    every bilinear node has at least one (gate, value) pair, with at
-    least one pair pointing back to layer ``L - 1`` to preserve the
+    Mixed node kinds
+    ----------------
+    Three optional fractions designate non-linear node kinds. They are
+    drawn independently per compute node, so the kind chosen for any
+    given node is exactly one of:
+
+    * Bilinear (``bilinear_fraction``):
+      ``pre = Σ_pairs σ(w_g · a_g) · w_v · a_v``  (parents in pairs,
+      two weights per pair)
+    * Product (``product_fraction``):
+      ``pre = Σ_pairs a_g · a_v``  (parents in pairs, no weights —
+      pure activation product, symmetric)
+    * Attention / softmax-aggregator (``attention_fraction``):
+      ``pre = Σ_k softmax(score_k) · value_k``  (parents in
+      ``(score, value)`` pairs, no weights — softmax taken across
+      the K pairs of one node)
+
+    The sum of the three must be ≤ 1. Whatever fraction is left over
+    stays linear: ``pre = Σ_k w_k · a_k``.
+
+    All non-linear kinds need an even number of parents (≥ 2). When
+    the random parent draw lands on an odd count we pad with one extra
+    earlier-layer parent that preserves the layer-(L − 1) invariant.
+
+    Bilinear gating nodes (legacy paragraph kept for context)
+    --------------------------------------------------------
+    Each bilinear node ``tanh``'s the gated sum just like a linear
+    node, so its output activation is in the same range. After pair
+    adjustment every bilinear node has at least one (gate, value)
+    pair, with at least one pair pointing back to layer ``L − 1`` to
+    preserve the
     longest-path placement.
     """
     if n_layers < 2:
@@ -377,38 +400,59 @@ def build_layered_rwnn(
         parents[j] = sorted(set(parents[j]) | {i})
         children_count[i] += 1
 
-    # Bilinear node-kind assignment (Option A: random, fixed fraction).
-    # Each compute node (hidden + output) is independently bilinear with
-    # probability bilinear_fraction. Bilinear nodes need an even parent
-    # count; if they have an odd count we pad with one extra random
-    # earlier-layer parent that preserves the layer-(L-1) invariant.
+    # Per-node kind assignment — independent draws per compute node.
+    # Kind codes match kernels.py:
+    #   0 = LINEAR (default), 1 = BILINEAR, 2 = PRODUCT, 3 = ATTENTION
+    # Validate fractions.
+    nonlin_total = bilinear_fraction + product_fraction + attention_fraction
+    if nonlin_total > 1.0 + 1e-9:
+        raise ValueError(
+            f"bilinear+product+attention fractions sum to {nonlin_total:.3f} > 1; "
+            f"each compute node has exactly one kind"
+        )
+
     node_kinds = np.zeros(N, dtype=np.int8)
-    if bilinear_fraction > 0.0:
+    if nonlin_total > 0.0:
+        # Cumulative thresholds for a single uniform draw → bucket.
+        t1 = bilinear_fraction                              # < t1 → BILINEAR
+        t2 = t1 + product_fraction                          # < t2 → PRODUCT
+        t3 = t2 + attention_fraction                        # < t3 → ATTENTION
+
         for i in range(bias_end, N):
-            if rng.random() < bilinear_fraction:
-                # Need at least 2 parents to form one (gate, value) pair.
-                if len(parents[i]) < 2:
-                    Li = int(layer[i])
-                    cand = np.concatenate(
-                        [nodes_at_layer[ℓ] for ℓ in range(Li)]
-                    )
-                    cand = cand[~np.isin(cand, parents[i])]
-                    if cand.size == 0:
-                        # Skip — can't make this node bilinear meaningfully.
-                        continue
+            r = rng.random()
+            if r < t1:
+                kind = 1
+            elif r < t2:
+                kind = 2
+            elif r < t3:
+                kind = 3
+            else:
+                kind = 0
+            if kind == 0:
+                continue
+
+            # Non-linear kinds all want pair-aligned parents (≥ 2, even).
+            # Pad with extra earlier-layer parents to satisfy the constraint.
+            if len(parents[i]) < 2:
+                Li = int(layer[i])
+                cand = np.concatenate(
+                    [nodes_at_layer[ℓ] for ℓ in range(Li)]
+                )
+                cand = cand[~np.isin(cand, parents[i])]
+                if cand.size == 0:
+                    # Can't make this node non-linear meaningfully — leave linear.
+                    continue
+                parents[i] = sorted(set(parents[i]) | {int(rng.choice(cand))})
+            if len(parents[i]) % 2 == 1:
+                Li = int(layer[i])
+                cand = np.concatenate(
+                    [nodes_at_layer[ℓ] for ℓ in range(Li)]
+                )
+                cand = cand[~np.isin(cand, parents[i])]
+                if cand.size == 0:
+                    parents[i] = parents[i][:-1]
+                else:
                     parents[i] = sorted(set(parents[i]) | {int(rng.choice(cand))})
-                # Even parent count for clean pairing.
-                if len(parents[i]) % 2 == 1:
-                    Li = int(layer[i])
-                    cand = np.concatenate(
-                        [nodes_at_layer[ℓ] for ℓ in range(Li)]
-                    )
-                    cand = cand[~np.isin(cand, parents[i])]
-                    if cand.size == 0:
-                        # Drop one to make even.
-                        parents[i] = parents[i][:-1]
-                    else:
-                        parents[i] = sorted(set(parents[i]) | {int(rng.choice(cand))})
-                node_kinds[i] = 1
+            node_kinds[i] = kind
 
     return _assemble_dag(n_in, n_bias, n_hidden, n_out, parents, node_kinds)

@@ -182,35 +182,86 @@ class RWNNLM(nn.Module):
         *,
         temperature: float = 1.0,
         top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float = 1.0,
+        rep_penalty_window: int = 64,
     ) -> torch.Tensor:
-        """Autoregressive sampling starting from ``prompt_ids`` of shape ``[T0]`` or ``[B, T0]``.
+        """Autoregressive sampling starting from ``prompt_ids`` of shape
+        ``[T0]`` or ``[B, T0]``. Returns concatenation ``[prompt | generated]``.
 
-        Returns the concatenation ``[prompt | generated]`` of shape
-        ``[B, T0 + max_new_tokens]``.
+        Sampling controls:
+
+        - ``temperature``: divide logits by this before softmax. >1 sharpens
+          less; <1 sharpens more. Set to 1.0 for the model's natural
+          distribution.
+        - ``top_k``: keep only the top-k logits, mask the rest to -inf.
+        - ``top_p``: nucleus sampling — keep the smallest set of tokens
+          whose cumulative probability ≥ ``top_p``. Combines with top_k
+          (intersection of the two filters).
+        - ``repetition_penalty``: divide logits of tokens that already
+          appeared in the last ``rep_penalty_window`` positions by this
+          factor (>1 → discourage repeats). 1.0 disables. GPT-2-style
+          implementation: positive logits are *divided*, negative ones
+          *multiplied*, so the penalty always pushes the value toward
+          zero (lower probability).
         """
         self.eval()
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
         B = prompt_ids.shape[0]
         T = self.cfg.context_length
+        V = self.cfg.vocab_size
         device = self.device
 
         out = prompt_ids.to(device)
         for _ in range(max_new_tokens):
-            # Take last T tokens; left-pad with 0 if the prompt is shorter.
+            # Rolling window context, left-pad with zeros if shorter.
             if out.shape[1] >= T:
                 ctx = out[:, -T:]
             else:
                 pad = torch.zeros((B, T - out.shape[1]), dtype=out.dtype, device=device)
                 ctx = torch.cat([pad, out], dim=1)
-            logits = self(ctx)                        # [B, V]
+            logits = self(ctx)                              # [B, V]
             logits = logits / max(temperature, 1e-8)
-            if top_k is not None and 0 < top_k < logits.shape[-1]:
+
+            # Repetition penalty over a rolling window of recent tokens.
+            if repetition_penalty != 1.0 and rep_penalty_window > 0:
+                window = out[:, -rep_penalty_window:]       # [B, ≤W]
+                # Build a [B, V] gather of logits at the recent token ids.
+                seen = torch.zeros_like(logits, dtype=torch.bool)
+                seen.scatter_(1, window, True)
+                # Apply: positive logits → divide; negative → multiply.
+                pos = logits.clamp(min=0.0)
+                neg = logits.clamp(max=0.0)
+                penalised = torch.where(
+                    seen,
+                    pos / repetition_penalty + neg * repetition_penalty,
+                    logits,
+                )
+                logits = penalised
+
+            # Top-k filter.
+            if top_k is not None and 0 < top_k < V:
                 v, _ = torch.topk(logits, top_k, dim=-1)
                 thresh = v[:, -1].unsqueeze(-1)
                 logits = torch.where(logits < thresh,
                                      torch.full_like(logits, float("-inf")),
                                      logits)
+
+            # Top-p (nucleus) filter — applied after top-k if both set.
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                cumprobs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                # Mask everything strictly past the nucleus.
+                drop = cumprobs > top_p
+                # Always keep the most-likely token (drop[..., 0] → False).
+                drop[..., 1:] = drop[..., :-1].clone()
+                drop[..., 0] = False
+                sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+                # Scatter back to original positions.
+                logits = torch.full_like(logits, float("-inf"))
+                logits.scatter_(1, sorted_idx, sorted_logits)
+
             probs = F.softmax(logits, dim=-1)
             next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
             out = torch.cat([out, next_ids], dim=1)

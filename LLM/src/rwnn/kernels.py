@@ -43,11 +43,12 @@ from triton.language.extra import libdevice
 def forward_level_kernel(
     a_ptr,                 # float32 [N, B] — activations (written for this level)
     pre_ptr,               # float32 [N, B] — pre-activations (written for this level)
-    weights_ptr,           # float32 [E]
+    weights_ptr,           # float32 [E_live]   — only weighted edges (kind 0,1 destinations)
     level_nodes_ptr,       # int32   [n_level]
     parent_offsets_ptr,    # int32   [N+1]
     parent_ids_ptr,        # int32   [E]
-    node_kinds_ptr,        # int8    [N] — 0 linear, 1 bilinear
+    node_kinds_ptr,        # int8    [N] — 0 linear, 1 bilinear, 2 product, 3 attention
+    node_weight_offsets_ptr,  # int32 [N+1] — start of node i's weights in weights_ptr
     B,                     # int — batch size
     BLOCK_B: tl.constexpr,
     ACT: tl.constexpr,     # 0 = linear, 1 = tanh
@@ -59,6 +60,7 @@ def forward_level_kernel(
     start = tl.load(parent_offsets_ptr + i).to(tl.int64)
     end = tl.load(parent_offsets_ptr + i + 1).to(tl.int64)
     kind = tl.load(node_kinds_ptr + i).to(tl.int32)
+    w_start = tl.load(node_weight_offsets_ptr + i).to(tl.int64)
 
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
@@ -69,7 +71,7 @@ def forward_level_kernel(
         # LINEAR: simple weighted sum over parents.
         for k in range(start, end):
             j = tl.load(parent_ids_ptr + k).to(tl.int64)
-            w = tl.load(weights_ptr + k)
+            w = tl.load(weights_ptr + w_start + (k - start))
             a_j = tl.load(a_ptr + j * B + offs_b, mask=mask_b, other=0.0)
             acc += w * a_j
     elif kind == 1:
@@ -77,8 +79,8 @@ def forward_level_kernel(
         for k in range(start, end, 2):
             jg = tl.load(parent_ids_ptr + k).to(tl.int64)
             jv = tl.load(parent_ids_ptr + k + 1).to(tl.int64)
-            wg = tl.load(weights_ptr + k)
-            wv = tl.load(weights_ptr + k + 1)
+            wg = tl.load(weights_ptr + w_start + (k - start))
+            wv = tl.load(weights_ptr + w_start + (k - start) + 1)
             a_g = tl.load(a_ptr + jg * B + offs_b, mask=mask_b, other=0.0)
             a_v = tl.load(a_ptr + jv * B + offs_b, mask=mask_b, other=0.0)
             zg = wg * a_g
@@ -172,11 +174,12 @@ def backward_propagate_kernel(
     a_ptr,                  # float32 [N, B] — needed to recompute g, v, scores
     pre_ptr,                # float32 [N, B] — needed for softmax-agg backward
     d_pre_ptr,              # float32 [N, B]
-    weights_ptr,            # float32 [E]
+    weights_ptr,            # float32 [E_live]
     level_nodes_ptr,        # int32 [n_level]
     parent_offsets_ptr,     # int32 [N+1]
     parent_ids_ptr,         # int32 [E]
     node_kinds_ptr,         # int8  [N]
+    node_weight_offsets_ptr,  # int32 [N+1]
     B,
     BLOCK_B: tl.constexpr,
 ):
@@ -187,6 +190,7 @@ def backward_propagate_kernel(
     start = tl.load(parent_offsets_ptr + i).to(tl.int64)
     end = tl.load(parent_offsets_ptr + i + 1).to(tl.int64)
     kind = tl.load(node_kinds_ptr + i).to(tl.int32)
+    w_start = tl.load(node_weight_offsets_ptr + i).to(tl.int64)
 
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
@@ -197,7 +201,7 @@ def backward_propagate_kernel(
         # LINEAR: each edge contributes w * d_pre to its parent.
         for k in range(start, end):
             j = tl.load(parent_ids_ptr + k).to(tl.int64)
-            w = tl.load(weights_ptr + k)
+            w = tl.load(weights_ptr + w_start + (k - start))
             tl.atomic_add(d_a_ptr + j * B + offs_b, w * d_pre_i, mask=mask_b)
     elif kind == 1:
         # BILINEAR: each (gate, value) pair contributes
@@ -207,8 +211,8 @@ def backward_propagate_kernel(
         for k in range(start, end, 2):
             jg = tl.load(parent_ids_ptr + k).to(tl.int64)
             jv = tl.load(parent_ids_ptr + k + 1).to(tl.int64)
-            wg = tl.load(weights_ptr + k)
-            wv = tl.load(weights_ptr + k + 1)
+            wg = tl.load(weights_ptr + w_start + (k - start))
+            wv = tl.load(weights_ptr + w_start + (k - start) + 1)
             a_g = tl.load(a_ptr + jg * B + offs_b, mask=mask_b, other=0.0)
             a_v = tl.load(a_ptr + jv * B + offs_b, mask=mask_b, other=0.0)
             zg = wg * a_g
@@ -265,13 +269,14 @@ def backward_propagate_kernel(
 def backward_weight_kernel(
     a_ptr,                  # float32 [N, B]
     d_pre_ptr,              # float32 [N, B]
-    weights_ptr,            # float32 [E]    — needed for bilinear partner weight
+    weights_ptr,            # float32 [E_live]   — needed for bilinear partner weight
     edge_src_ptr,           # int32 [E]
     edge_dst_ptr,           # int32 [E]
     parent_offsets_ptr,     # int32 [N+1]    — to compute partner edge index
     parent_ids_ptr,         # int32 [E]      — to look up partner src
     node_kinds_ptr,         # int8  [N]
-    d_w_ptr,                # float32 [E]    — output
+    node_weight_offsets_ptr,  # int32 [N+1]
+    d_w_ptr,                # float32 [E_live]   — gradient for compact weights
     B,
     BLOCK_B: tl.constexpr,
 ):
@@ -280,6 +285,17 @@ def backward_weight_kernel(
     src = tl.load(edge_src_ptr + e).to(tl.int64)
     dst = tl.load(edge_dst_ptr + e).to(tl.int64)
     kind = tl.load(node_kinds_ptr + dst).to(tl.int32)
+
+    # PRODUCT (2) and SOFTMAX_AGG (3): no weight allocated, no gradient
+    # to compute. Skip entirely (no store needed — weights tensor doesn't
+    # have a slot for this edge).
+    if kind >= 2:
+        return
+
+    dst_parent_start = tl.load(parent_offsets_ptr + dst).to(tl.int64)
+    dst_w_start = tl.load(node_weight_offsets_ptr + dst).to(tl.int64)
+    pos_in_dst = e - dst_parent_start
+    w_idx = dst_w_start + pos_in_dst
 
     if kind == 0:
         # LINEAR: d w_e = Σ_b a[src, b] * d_pre[dst, b]
@@ -293,25 +309,21 @@ def backward_weight_kernel(
             acc += a_src * d_pre_dst
             off += BLOCK_B
         total = tl.sum(acc, axis=0)
-        tl.store(d_w_ptr + e, total)
-    elif kind >= 2:
-        # PRODUCT (2) and SOFTMAX_AGG (3) have no learnable weights — the
-        # weight tensor entries for these edges are unused. d_w[e] = 0.
-        tl.store(d_w_ptr + e, 0.0)
+        tl.store(d_w_ptr + w_idx, total)
     else:
         # BILINEAR: depends on whether this edge is the gate (even pos in
         # parent list) or the value (odd pos). Partner edge gives us the
         # other side of the pair.
-        dst_start = tl.load(parent_offsets_ptr + dst).to(tl.int64)
-        pos = e - dst_start
-        is_gate = (pos % 2) == 0
+        is_gate = (pos_in_dst % 2) == 0
         if is_gate:
             partner_e = e + 1
+            partner_w_idx = w_idx + 1
         else:
             partner_e = e - 1
+            partner_w_idx = w_idx - 1
         partner_src = tl.load(parent_ids_ptr + partner_e).to(tl.int64)
-        w_partner = tl.load(weights_ptr + partner_e)
-        w_self = tl.load(weights_ptr + e)
+        w_partner = tl.load(weights_ptr + partner_w_idx)
+        w_self = tl.load(weights_ptr + w_idx)
 
         acc = tl.zeros([BLOCK_B], dtype=tl.float32)
         off = 0
@@ -337,4 +349,4 @@ def backward_weight_kernel(
                 acc += g * a_self * d_pre_dst
             off += BLOCK_B
         total = tl.sum(acc, axis=0)
-        tl.store(d_w_ptr + e, total)
+        tl.store(d_w_ptr + w_idx, total)

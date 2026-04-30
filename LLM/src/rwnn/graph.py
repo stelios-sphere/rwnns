@@ -61,10 +61,18 @@ class RandomDAG:
     # Per-node fan-in, handy for weight init.
     fan_in: torch.Tensor          # int32 [N]
 
-    # Per-node kind. 0 = LINEAR, 1 = BILINEAR (gating). Bilinear nodes
-    # have an even number of parents paired as (gate, value); they
-    # compute  tanh( Σ_pairs σ(w_g · a_g) · w_v · a_v ).
+    # Per-node kind. 0 = LINEAR, 1 = BILINEAR (gating), 2 = PRODUCT,
+    # 3 = SOFTMAX_AGG (attention). Linear and bilinear nodes use
+    # learnable per-edge weights; product and softmax_agg do not.
     node_kinds: torch.Tensor      # int8 [N]
+
+    # CSR over the *learnable* weight tensor. node_weight_offsets[i] is
+    # the position in the compact weights array where node i's weights
+    # begin; node i has node_weight_offsets[i+1] − node_weight_offsets[i]
+    # weights, equal to its parent count for kind ∈ {0,1} and zero
+    # otherwise. n_live_edges == node_weight_offsets[-1] is the total
+    # learnable weight count.
+    node_weight_offsets: torch.Tensor  # int32 [N+1]
 
     # Convenience.
     input_ids: torch.Tensor       # int32 [n_in]
@@ -78,6 +86,11 @@ class RandomDAG:
     @property
     def n_edges(self) -> int:
         return int(self.parent_ids.numel())
+
+    @property
+    def n_live_edges(self) -> int:
+        """Number of *weighted* edges (kind 0 or 1 destinations only)."""
+        return int(self.node_weight_offsets[-1].item())
 
     @property
     def n_levels(self) -> int:
@@ -163,6 +176,18 @@ def _assemble_dag(
         node_kinds_np = np.asarray(node_kinds, dtype=np.int8)
         assert node_kinds_np.shape == (N,)
 
+    # Compact weight indexing. Each node i with kind ∈ {0, 1} contributes
+    # parent_count[i] learnable weights; kind ∈ {2, 3} contributes 0.
+    # node_weight_offsets[i] is the start offset of node i's weights in
+    # the compact weights tensor; node_weight_offsets[-1] is the total
+    # number of learnable weights (n_live_edges).
+    node_weight_count_np = np.zeros(N, dtype=np.int64)
+    parent_count_np = np.diff(parent_offsets_np)
+    is_weighted_kind = np.isin(node_kinds_np, (0, 1))
+    node_weight_count_np[is_weighted_kind] = parent_count_np[is_weighted_kind]
+    node_weight_offsets_np = np.zeros(N + 1, dtype=np.int64)
+    np.cumsum(node_weight_count_np, out=node_weight_offsets_np[1:])
+
     return RandomDAG(
         n_in=n_in,
         n_bias=n_bias,
@@ -177,6 +202,7 @@ def _assemble_dag(
         level_is_output=torch.as_tensor(level_is_output_np),
         fan_in=t(fan_in_np),
         node_kinds=torch.as_tensor(node_kinds_np, dtype=torch.int8),
+        node_weight_offsets=t(node_weight_offsets_np),
         input_ids=t(np.arange(0, inputs_end, dtype=np.int64)),
         bias_ids=t(np.arange(inputs_end, bias_end, dtype=np.int64)),
         output_ids=t(np.arange(hidden_end, N, dtype=np.int64)),

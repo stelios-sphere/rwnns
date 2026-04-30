@@ -35,7 +35,7 @@ class RWNNFunction(torch.autograd.Function):
     def forward(
         ctx,
         x: torch.Tensor,             # [B, n_in]
-        weights: torch.Tensor,       # [E]
+        weights: torch.Tensor,       # [E_live]
         parent_offsets: torch.Tensor,
         parent_ids: torch.Tensor,
         edge_src: torch.Tensor,
@@ -47,6 +47,7 @@ class RWNNFunction(torch.autograd.Function):
         bias_ids: torch.Tensor,
         output_ids: torch.Tensor,
         node_kinds: torch.Tensor,
+        node_weight_offsets: torch.Tensor,
         n_nodes: int,
     ) -> torch.Tensor:
         assert x.is_cuda and weights.is_cuda, "RWNN requires CUDA tensors"
@@ -84,6 +85,7 @@ class RWNNFunction(torch.autograd.Function):
                 parent_offsets,
                 parent_ids,
                 node_kinds,
+                node_weight_offsets,
                 B,
                 BLOCK_B=_BLOCK_B,
                 ACT=act,
@@ -95,11 +97,12 @@ class RWNNFunction(torch.autograd.Function):
             a, pre, weights,
             parent_offsets, parent_ids, edge_src, edge_dst,
             level_nodes, level_starts, level_is_output,
-            input_ids, output_ids, node_kinds,
+            input_ids, output_ids, node_kinds, node_weight_offsets,
         )
         ctx.B = B
         ctx.N = N
         ctx.n_edges = int(edge_src.numel())
+        ctx.n_live_edges = int(weights.numel())
         return out
 
     @staticmethod
@@ -107,10 +110,12 @@ class RWNNFunction(torch.autograd.Function):
         (a, pre, weights,
          parent_offsets, parent_ids, edge_src, edge_dst,
          level_nodes, level_starts, level_is_output,
-         input_ids, output_ids, node_kinds) = ctx.saved_tensors
+         input_ids, output_ids, node_kinds,
+         node_weight_offsets) = ctx.saved_tensors
         B = ctx.B
         N = ctx.N
         E = ctx.n_edges
+        E_live = ctx.n_live_edges
         device = a.device
 
         d_a = torch.zeros((N, B), device=device, dtype=torch.float32)
@@ -137,16 +142,18 @@ class RWNNFunction(torch.autograd.Function):
             )
             backward_propagate_kernel[grid](
                 d_a, a, pre, d_pre, weights, level_slice,
-                parent_offsets, parent_ids, node_kinds,
+                parent_offsets, parent_ids, node_kinds, node_weight_offsets,
                 B, BLOCK_B=_BLOCK_B,
             )
 
-        # Per-edge weight gradient.
-        d_w = torch.zeros(E, device=device, dtype=torch.float32)
+        # Per-(live-)edge weight gradient. d_w has compact shape [E_live].
+        # Kernel grid still iterates all E edges; for kind 2/3 destinations
+        # the kernel returns early without writing.
+        d_w = torch.zeros(E_live, device=device, dtype=torch.float32)
         if E > 0:
             backward_weight_kernel[(E,)](
                 a, d_pre, weights, edge_src, edge_dst,
-                parent_offsets, parent_ids, node_kinds,
+                parent_offsets, parent_ids, node_kinds, node_weight_offsets,
                 d_w,
                 B, BLOCK_B=_BLOCK_B,
             )
@@ -157,7 +164,7 @@ class RWNNFunction(torch.autograd.Function):
         # Return grads for every argument of forward() in order.
         return (d_x, d_w,
                 None, None, None, None, None, None, None,
-                None, None, None, None, None)
+                None, None, None, None, None, None)
 
 
 class RWNN(torch.nn.Module):
@@ -173,20 +180,28 @@ class RWNN(torch.nn.Module):
         graph = graph.to(device)
         self._n_nodes = graph.n_nodes
         self._n_edges = graph.n_edges
+        self._n_live_edges = graph.n_live_edges
         self._n_levels = graph.n_levels
         self._n_in = graph.n_in
         self._n_bias = graph.n_bias
         self._n_hidden = graph.n_hidden
         self._n_out = graph.n_out
 
-        # Per-destination Xavier-ish weight init: U(-k, +k) with
-        # k = sqrt(6 / (fan_in + fan_out_estimate)), but fan_out varies
-        # wildly per node in a random DAG. Use the simpler 1/sqrt(fan_in)
-        # rule evaluated per destination.
+        # Per-destination 1/√fan_in init, only for *live* edges (i.e. those
+        # going into kind 0 or 1 destinations). Product (kind 2) and
+        # softmax-aggregator (kind 3) nodes have no learnable per-edge
+        # weights; we don't allocate slots for them.
         edge_dst_long = graph.edge_dst.long()
         fan_in_per_edge = graph.fan_in[edge_dst_long].clamp(min=1).float()
-        scale = (1.0 / fan_in_per_edge.sqrt()) * math.sqrt(3.0)
-        w = (torch.rand(graph.n_edges, device=device) * 2 - 1) * scale
+        edge_kind = graph.node_kinds.to(torch.int64)[edge_dst_long]
+        is_live_edge = (edge_kind <= 1)
+        live_fan_in = fan_in_per_edge[is_live_edge]
+        scale = (1.0 / live_fan_in.sqrt()) * math.sqrt(3.0)
+        n_live = int(is_live_edge.sum().item())
+        assert n_live == graph.n_live_edges, (
+            f"live edge count mismatch: {n_live} vs {graph.n_live_edges}"
+        )
+        w = (torch.rand(n_live, device=device) * 2 - 1) * scale
         self.weights = torch.nn.Parameter(w.contiguous())
 
         # Graph tensors as non-learnable buffers.
@@ -201,6 +216,8 @@ class RWNN(torch.nn.Module):
         self.register_buffer("bias_ids", graph.bias_ids.contiguous())
         self.register_buffer("output_ids", graph.output_ids.contiguous())
         self.register_buffer("node_kinds", graph.node_kinds.contiguous())
+        self.register_buffer("node_weight_offsets",
+                             graph.node_weight_offsets.contiguous())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
@@ -212,7 +229,7 @@ class RWNN(torch.nn.Module):
             self.edge_src, self.edge_dst,
             self.level_nodes, self.level_starts, self.level_is_output,
             self.input_ids, self.bias_ids, self.output_ids,
-            self.node_kinds,
+            self.node_kinds, self.node_weight_offsets,
             self._n_nodes,
         )
 
